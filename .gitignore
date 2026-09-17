@@ -1,0 +1,18 @@
+# ==== 个人数据,绝不入库(含邮箱 / 授权码 / 履历) ====
+notify_secret.json
+notify_state.json
+countdown_config.json
+自检结果.txt
+发信错误日志.txt
+
+# ==== Python 缓存 / 编译产物 ====
+__pycache__/
+*.pywc
+*.pyc
+
+# ==== 打包中间产物 ====
+构建中间产物_*/
+spec_*/
+build/
+dist/
+上一版*.exe

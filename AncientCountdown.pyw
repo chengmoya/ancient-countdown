@@ -1,0 +1,2933 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+古风倒计时 · Ancient Countdown
+================================
+极低资源占用的桌面倒计时小工具
+
+设计目标
+  · 空闲 CPU  ≈ 0%      —— 不使用死循环，按「对齐到下一秒」的方式调度，每秒仅一次轻量重绘
+  · 内存占用  ≈ 20 MB   —— Tk 原生窗口，无浏览器内核 / 无 Electron
+  · 冷启动    < 0.5 s   —— 单文件脚本，无第三方依赖
+
+功能
+  1. 目标时间解析        支持 "10.1.11.30" 这类简洁写法（月.日.时.分）
+  2. 大字号倒计时        天 / 時 / 分 / 秒
+  3. 窗口尺寸            可锁定固定大小，也可拖拽任意边缘自由缩放
+  4. 颜色规则            多档阈值，剩余时间越少颜色越紧迫，可自定义前景色与底色
+  5. 归零提示            「時辰已到」闪烁
+  6. 古风画风            宣纸底 · 古铜双框 · 朱砂印 · 楷体
+
+操作
+  拖动窗口内部  = 移动窗口        拖动窗口边缘 = 缩放窗口
+  双击 / 点击右上「設」 = 打开设置      右键 = 菜单
+"""
+
+import datetime
+import glob
+import hashlib
+import json
+import os
+import random
+import re
+import shutil
+import sys
+import time
+import tkinter as tk
+from tkinter import font as tkfont
+
+# --------------------------------------------------------------------------
+# 常量
+# --------------------------------------------------------------------------
+
+APP_NAME = "古风倒计时"
+APP_SUB = "ANCIENT COUNTDOWN"
+
+MIN_W, MIN_H = 300, 150          # 窗口最小尺寸
+RESIZE_MARGIN = 9                # 边缘拖拽感应带宽度(px)
+TICK_IDLE_MS = 600               # 归零状态闪烁间隔
+MIN_VISIBLE_W, MIN_VISIBLE_H = 140, 70   # 窗口在桌面内的最小露出尺寸，不足即视为「跑到屏幕外」
+
+# 单实例名后面会拼上数据目录的路径指纹（见 acquire_single_instance）：
+# 这样「演练实例」和「真正在用的实例」互不干扰，否则跑一次自检就会
+# 让真程序以为「已经有一个在跑了」，其实是它自己把门堵上。
+MUTEX_NAME = "Local\\AncientCountdown_SingleInstance"
+WAKE_FILE = "_wake.signal"       # 第二个实例留下的「请现身」信号
+
+# ---- 飞书传信（邮件通知）----
+# 核心原则：发信一律派生独立进程去做。smtplib 导入要几 MB，
+# 网络请求最长可阻塞 20 秒——放进主进程等于给常驻开销和界面流畅度找麻烦。
+NOTIFY_CHECK_SEC = 30            # 巡检间隔：每 30 秒最多判断一次，进一步压低开销
+NOTIFY_RETRY_SEC = 600           # 发信失败后隔多久重试
+NOTIFY_MAX_RETRY = 3             # 同一条规则最多重试几次
+NOTIFY_SENDING_TIMEOUT = 180     # 「发送中」超过这个秒数视为发信进程已死，允许重试
+NOTIFY_BODY_LIMIT = 4000         # 邮件正文上限（字节），防意外超长
+SIGNATURE_LIMIT = 24             # 本机抬头最大字数：它要进主题，太长会把标题挤爆
+
+MAILER_FILE = "mailer.pyw"
+NOTIFY_TASK_FILE = "notify_task.json"
+NOTIFY_RESULT_FILE = "notify_result.json"
+NOTIFY_TEST_RESULT_FILE = "notify_test_result.json"
+NOTIFY_STATE_FILE = "notify_state.json"
+NOTIFY_SECRET_FILE = "notify_secret.json"
+
+# 常见邮箱的 SMTP 参数：(显示名, 服务器, 端口, 是否 SSL)
+# 选服务商只填邮箱地址和授权码即可，服务器参数自动带出
+SMTP_PROVIDERS = [
+    ("QQ 邮箱",     "smtp.qq.com",        465, True),
+    ("QQ 企业邮箱", "smtp.exmail.qq.com",  465, True),
+    ("163 邮箱",    "smtp.163.com",       465, True),
+    ("126 邮箱",    "smtp.126.com",       465, True),
+    ("新浪邮箱",    "smtp.sina.com",      465, True),
+    ("阿里云邮箱",  "smtp.aliyun.com",    465, True),
+    ("Gmail",       "smtp.gmail.com",     465, True),
+    ("Outlook",     "smtp.office365.com", 587, False),
+    ("自定义",      "",                   465, True),
+]
+PROVIDER_NAMES = [p[0] for p in SMTP_PROVIDERS]
+
+# 古风预设色板（设置面板中的调色选项）
+PRESET_COLORS = [
+    ("朱砂", "#B03A2E"), ("胭脂", "#D9707F"), ("琥珀", "#C08A1E"),
+    ("鎏金", "#D9A13B"), ("竹青", "#4F7A52"), ("松绿", "#3E7C6A"),
+    ("靛蓝", "#3E6E9E"), ("黛紫", "#7B5EA7"), ("墨黑", "#2B2622"),
+    ("玄灰", "#6B5F52"), ("月白", "#F2EFE4"), ("素笺", "#EFE4CE"),
+]
+
+DEFAULT_CONFIG = {
+    "target": "10.1.11.30",
+    "locked": False,             # 锁定窗口尺寸
+    "always_on_top": True,
+    "window": {"x": None, "y": None, "w": 620, "h": 300},
+
+    "palette": {
+        "paper":       "#EFE4CE",   # 宣纸底
+        "paper_night": "#1C1A17",   # 夜色底（紧急状态用）
+        "ink":         "#2B2622",   # 墨
+        "ink_soft":    "#6B5F52",   # 淡墨
+        "border":      "#8C6B4A",   # 古铜框
+        "border_soft": "#C4A87C",   # 浅铜框
+        "seal":        "#B03A2E",   # 朱砂
+        "default_fg":  "#3A322A",   # 常态字色
+    },
+
+    # 颜色规则：剩余时间 <= days 天时，切换到 color（底色 bg 可选）
+    # 数组顺序无关，程序自动按 days 从小到大匹配「最紧迫」的一条
+    "thresholds": [
+        {"days": 7.0,  "color": "#4F7A52", "bg": None, "label": "一周内"},
+        {"days": 4.0,  "color": "#C08A1E", "bg": None, "label": "四天内"},
+        {"days": 2.0,  "color": "#B03A2E", "bg": None, "label": "两日内"},
+        {"days": 0.5,  "color": "#F2EFE4", "bg": "#1C1A17", "label": "最后半日"},
+    ],
+
+    "zero_text": "時辰已到",
+    "zero_color": "#B03A2E",
+    "zero_color_alt": "#D9A13B",
+
+    # 鸿雁传书：剩余时间跨过某一档时，寄一封邮件给你
+    # 授权码不在这里 —— 单独存在 notify_secret.json，
+    # 这样你把配置分享给别人时不会连密码一起带出去。
+    "notify": {
+        "enabled": False,
+        "provider": "QQ 邮箱",
+        "host": "smtp.qq.com",
+        "port": 465,
+        "use_ssl": True,
+        "user": "",                 # 发件邮箱（同时是 SMTP 登录账号）
+        "to": "",                   # 收件邮箱；留空 = 发给自己
+        # 本机抬头：多台电脑都装了这个小工具时，用来分辨信是哪台寄的。
+        # 会同时出现在「发件人显示名」「主题前缀」「正文落款」三处，
+        # 前两处不用点开邮件就能看见。留空 = 不加抬头。
+        # 首次运行会自动种入计算机名，想改成「书房台机」这样更好记的再改。
+        "signature": "",
+        "rules": [                  # 可自由增删；days 支持小数，0.5 即 12 小时
+            {"days": 2.0, "enabled": True, "label": "剩两日"},
+            {"days": 0.5, "enabled": True, "label": "最后半日"},
+            {"days": 0.0, "enabled": True, "label": "时辰已到"},
+        ],
+    },
+}
+
+# 古风文字表
+CN_MONTHS = ["正月", "二月", "三月", "四月", "五月", "六月",
+             "七月", "八月", "九月", "十月", "冬月", "腊月"]
+CN_DAYS = ["", "初一", "初二", "初三", "初四", "初五", "初六", "初七", "初八", "初九", "初十",
+           "十一", "十二", "十三", "十四", "十五", "十六", "十七", "十八", "十九", "二十",
+           "廿一", "廿二", "廿三", "廿四", "廿五", "廿六", "廿七", "廿八", "廿九", "三十"]
+CN_SHICHEN = ["子", "丑", "寅", "卯", "辰", "巳", "午", "未", "申", "酉", "戌", "亥"]
+CN_NUMS = "〇一二三四五六七八九"
+
+
+# --------------------------------------------------------------------------
+# 工具函数
+# --------------------------------------------------------------------------
+
+def screen_rect(root=None):
+    """
+    返回「虚拟桌面」（含所有显示器）的范围 (left, top, right, bottom)。
+
+    为什么不用 Tk 自带的 winfo_screenwidth？因为它只认主显示器：
+    窗口放到副屏、或副屏被拔掉之后，坐标会被算错，窗口就会跑到看不见的地方。
+    这里优先向系统要整个虚拟桌面的范围，拿不到再退回主屏尺寸。
+    """
+    try:
+        import ctypes
+        g = ctypes.windll.user32.GetSystemMetrics
+        left, top = g(76), g(77)          # SM_XVIRTUALSCREEN / SM_YVIRTUALSCREEN
+        width, height = g(78), g(79)      # SM_CXVIRTUALSCREEN / SM_CYVIRTUALSCREEN
+        if width > 0 and height > 0:
+            return left, top, left + width, top + height
+    except Exception:
+        pass
+    if root is not None:
+        return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
+    return 0, 0, 1920, 1080
+
+
+def hwnd_of(widget):
+    """
+    Tk 部件对应的 Windows 顶层窗口句柄。
+
+    取不到时返回 0 —— 调用方据此回退到 Tk 自己的路子，不要在这里抛异常。
+    注意 GetParent 这一层：Tk 每个部件都有自己的 HWND，真正那个
+    带边框的顶层窗口在父级上，Class 名叫 TkTopLevel。
+    """
+    try:
+        import ctypes
+        hid = widget.winfo_id()
+        return ctypes.windll.user32.GetParent(hid) or hid
+    except Exception:                 # noqa: BLE001
+        return 0
+
+
+def move_window(widget, x, y):
+    """把顶层窗口移到绝对坐标 (x, y)，允许负值。返回是否成功。"""
+    hwnd = hwnd_of(widget)
+    if not hwnd:
+        return False
+    try:
+        import ctypes
+        # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+        return bool(ctypes.windll.user32.SetWindowPos(
+            hwnd, 0, int(x), int(y), 0, 0, 0x0001 | 0x0004 | 0x0010))
+    except Exception:                 # noqa: BLE001
+        return False
+
+
+def set_window_pos(widget, x, y):
+    """
+    摆放顶层窗口的位置。这是全程序**唯一**该写窗口位置的地方。
+
+    为什么要分两条路 —— Tk 的 geometry 字符串里，负号不是负号：
+        "+80-292" 的含义是「距屏幕右边? 不，距屏幕**底边** 292」，
+        而不是「y 坐标等于 -292」。
+    所以窗口坐标一旦为负，用 geometry 表达出来的位置就是错的：
+      · 多显示器把扩展屏摆在主屏左边/上边时，虚拟桌面起点就是负的；
+      · 小屏笔记本上面板比屏幕还高，要往上挪时，y 也会变负。
+    这两种情况都只能直接调系统接口，走 SetWindowPos。
+    坐标非负时仍然走 Tk 老路子，保持和以前完全一致的行为。
+    """
+    x, y = int(x), int(y)
+    if x >= 0 and y >= 0:
+        widget.geometry("+%d+%d" % (x, y))
+        return
+    if not move_window(widget, x, y):
+        # 系统接口都失败了就只能认了：负坐标喂给 geometry 不报错也不生效，
+        # 窗口留在原地，总好过挪到错误的位置上去。
+        pass
+
+
+def set_geometry(widget, w, h, x, y):
+    """同时定尺寸和位置（位置允许为负，见 set_window_pos）。"""
+    widget.geometry("%dx%d" % (int(w), int(h)))
+    set_window_pos(widget, x, y)
+
+
+def acquire_single_instance():
+    """
+    单实例锁。True = 本进程是唯一实例；False = 已经有实例在跑了。
+
+    用系统命名互斥体而不是锁文件：进程被强杀（任务管理器结束进程）时，
+    系统会自动释放，不会留下一个假的「已经在运行」状态把程序永久锁死。
+
+    锁名带上数据目录的指纹：正常使用时所有实例共用同一个目录，行为不变；
+    演练（设了 ANCIENT_COUNTDOWN_HOME）则另开一把锁，不会把真程序挡在门外。
+    """
+    try:
+        import ctypes
+        # use_last_error=True：否则 CreateMutexW 之后读到的 last error
+        # 可能已经被解释器内部的其它调用覆盖掉
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        tag = hashlib.md5(os.path.abspath(DATA_DIR).lower().encode("utf-8")).hexdigest()[:12]
+        handle = k32.CreateMutexW(None, False, "%s_%s" % (MUTEX_NAME, tag))
+        if not handle:
+            return True                      # 系统调用失败就放行，不要反过来卡住自己
+        if ctypes.get_last_error() == 183:   # ERROR_ALREADY_EXISTS
+            return False
+        return True                          # handle 故意不关闭，锁随进程存活
+    except Exception:
+        return True
+
+
+def wake_file_path():
+    return os.path.join(DATA_DIR, WAKE_FILE)
+
+
+def request_wake():
+    """请已有实例把窗口挪到可见处——用户双击，本意就是「我要看见它」。"""
+    try:
+        with open(wake_file_path(), "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+        return True
+    except OSError:
+        return False
+
+
+def clear_wake_file():
+    """清掉可能残留的信号文件，避免刚启动就自己触发一次「现身」。"""
+    try:
+        os.remove(wake_file_path())
+    except OSError:
+        pass
+
+
+def script_home():
+    """
+    程序自己所在的目录（每次都现算，不缓存）。
+
+    单独抽出来是因为 app_dir() 的结果会被 DATA_DIR 拿去当常量存下来，
+    而「把发信脚本放哪儿」这件事是随时要问的 —— 两件事混用一个入口，
+    测试里想模拟 exe 环境就得连模块一起重载，太重了。
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.path.dirname(os.path.abspath(sys.argv[0]))
+
+
+def app_dir():
+    """程序所在目录（兼容 PyInstaller 打包后的 exe）。"""
+    return script_home()
+
+
+def data_dir():
+    """
+    配置与状态文件的存放目录。
+
+    默认就是程序所在目录，和以前完全一样。
+    只有设了环境变量 ANCIENT_COUNTDOWN_HOME 时才改道 —— 这个口子留给
+    「演练」用：自检、试跑、测量时把数据写进临时目录，
+    就不会把使用者真正的配置和寄信履历弄脏。
+    """
+    override = os.environ.get("ANCIENT_COUNTDOWN_HOME")
+    if override:
+        try:
+            os.makedirs(override, exist_ok=True)
+            return override
+        except OSError:
+            pass
+    return app_dir()
+
+
+DATA_DIR = data_dir()
+
+CONFIG_PATH = os.path.join(DATA_DIR, "countdown_config.json")
+NOTIFY_TASK_PATH = os.path.join(DATA_DIR, NOTIFY_TASK_FILE)
+NOTIFY_RESULT_PATH = os.path.join(DATA_DIR, NOTIFY_RESULT_FILE)
+NOTIFY_TEST_RESULT_PATH = os.path.join(DATA_DIR, NOTIFY_TEST_RESULT_FILE)
+NOTIFY_STATE_PATH = os.path.join(DATA_DIR, NOTIFY_STATE_FILE)
+NOTIFY_SECRET_PATH = os.path.join(DATA_DIR, NOTIFY_SECRET_FILE)
+# 发信脚本是「程序」不是「数据」，始终跟着程序走
+MAILER_PATH = os.path.join(app_dir(), MAILER_FILE)
+
+
+def deep_merge(base, override):
+    """把 override 合并进 base 的副本（保留 base 中缺失的默认键）。"""
+    out = dict(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fp:
+            raw = json.load(fp)
+        if not isinstance(raw, dict):
+            raw = {}
+    except Exception:
+        # 首次运行读不到、或配置损坏 —— 都当空配置处理，不阻塞启动
+        raw = {}
+
+    # 先深拷贝默认值：deep_merge 只做浅拷贝，盘上缺哪个键，
+    # 合并结果里那一层就和模块级 DEFAULT_CONFIG 共用同一个 dict，
+    # 后面任何就地改动（比如给 notify 补种抬头）都会把默认值本身弄脏。
+    base = json.loads(json.dumps(DEFAULT_CONFIG))
+    cfg = deep_merge(base, raw)
+
+    # 一次性补种本机抬头：盘上的配置里没有这个键时，用计算机名种进去，
+    # 这样多台机器装上去开箱就能分辨，用户想改成「书房台机」再改。
+    # 判据必须是「盘上原始配置有没有这个键」，不能看合并后的值 ——
+    # 合并会把默认值补上，就分不清「从没设过」和「用户特意清空了」。
+    if "signature" not in (raw.get("notify") or {}):
+        cfg["notify"] = dict(cfg.get("notify") or {}, signature=machine_name())
+    return cfg
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as fp:
+            json.dump(cfg, fp, ensure_ascii=False, indent=2)
+        return True, ""
+    except Exception as exc:                      # noqa: BLE001
+        return False, str(exc)
+
+
+# --------------------------------------------------------------------------
+# 鸿雁传书 · 状态与凭据
+#
+# 三份文件各司其职，互不干扰：
+#   countdown_config.json  你的设置（可随意分享）
+#   notify_secret.json     邮箱授权码（含密码，别外传）
+#   notify_state.json      发送履历（程序自己维护，你不需要看）
+# 拆开的好处是：频繁写履历不会碰到设置文件，也就不会把设置写坏。
+# --------------------------------------------------------------------------
+
+def _stamp(fmt="%Y-%m-%d %H:%M:%S"):
+    return datetime.datetime.now().strftime(fmt)
+
+
+def _load_json(path, fallback):
+    try:
+        with open(path, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        return data if data is not None else json.loads(json.dumps(fallback))
+    except Exception:                             # noqa: BLE001
+        return json.loads(json.dumps(fallback))
+
+
+def _save_json(path, data):
+    """原子写入：先写临时文件再替换，中途出错也不会留下半截文件。"""
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fp:
+            json.dump(data, fp, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+        return True, ""
+    except Exception as exc:                      # noqa: BLE001
+        return False, str(exc)
+
+
+def load_notify_state():
+    st = _load_json(NOTIFY_STATE_PATH, {"target_key": "", "history": []})
+    if not isinstance(st, dict):
+        st = {"target_key": "", "history": []}
+    st.setdefault("target_key", "")
+    if not isinstance(st.get("history"), list):
+        st["history"] = []
+    return st
+
+
+def save_notify_state(st):
+    return _save_json(NOTIFY_STATE_PATH, st)
+
+
+def load_notify_secret():
+    sec = _load_json(NOTIFY_SECRET_PATH, {"smtp_password": ""})
+    if not isinstance(sec, dict):
+        sec = {"smtp_password": ""}
+    sec.setdefault("smtp_password", "")
+    return sec
+
+
+def save_notify_secret(sec):
+    return _save_json(NOTIFY_SECRET_PATH, sec)
+
+
+def is_frozen():
+    """是不是被打包成了 exe。"""
+    return bool(getattr(sys, "frozen", False))
+
+
+def looks_like_python(exe):
+    """这个路径像个 Python 解释器（含 python3.14.exe / pythonw.exe 这类带版本号的）。"""
+    base = os.path.basename(exe or "").lower()
+    return base.startswith("python") or base.startswith("py")
+
+
+def resolve_python():
+    """
+    找一个能跑 .pyw 的解释器 —— 发信脚本要靠它启动。
+
+    平时开发运行（python AncientCountdown.pyw），sys.executable 就是解释器本身。
+    打包成 exe 之后 sys.executable 变成 exe，已经不是解释器了，
+    得去 PATH 和各处常见位置摸一遍；摸不到就回退到自带的 python 启动器 py.exe。
+    """
+    exe = sys.executable or ""
+    if exe and not is_frozen() and looks_like_python(exe):
+        if exe.lower().endswith("python.exe"):
+            cand = exe[:-len("python.exe")] + "pythonw.exe"
+            if os.path.exists(cand):
+                return cand
+        return exe
+
+    which = shutil.which("pythonw") or shutil.which("python")
+    if which:
+        return which
+    # (c) 实在找不到就退回系统的 py 启动器 —— 它按 shebang / 注册表找解释器
+    return which or "py"
+
+
+def ensure_mailer():
+    """
+    把发信脚本落好，返回它的路径；落不了就返回 None。
+
+    平时它就在程序旁边（源码 / 单文件 exe 都是），直接返回。
+    打包成「单个 exe」时它是被临时解出来的，下次运行就没了 ——
+    所以做成：程序旁边没有就照存一份。这样无论跑的是哪一种，
+    用户都能在文件夹里翻到这个脚本，自己核对它到底会寄什么。
+
+    注意这里用的是「存脚本的那个目录」而不是 app_dir()：
+    app_dir() 是模块加载时算好的常量（DATA_DIR 也一样），
+    测试要让它变就得连整个模块重载 —— 那是测试在给代码让路。
+    抽成函数之后，跑一次就是读一次，没有可缓存的状态。
+    """
+    root = script_home()
+    here = os.path.join(root, MAILER_FILE)
+    if os.path.exists(here):
+        return here
+    src = ""
+    if is_frozen():
+        src = os.path.join(getattr(sys, "_MEIPASS", "") or "", MAILER_FILE)
+    if not src or not os.path.exists(src):
+        return None
+    try:
+        shutil.copyfile(src, here)
+        return here
+    except OSError:
+        return src or None
+
+
+def mailer_target():
+    """
+    交给发信进程的执行目标。
+    正常是 .pyw 脚本路径；打包后若 .pyw 关联到了别的编辑器等程序，就改成自调。
+    """
+    path = ensure_mailer()
+    if not path:
+        return path, []
+    if is_frozen() and os.path.basename(sys.executable).lower().endswith(".exe"):
+        return sys.executable, [path]
+    return path, []
+
+
+def run_mailer_cli(argv):
+    """
+    `AncientCountdown.exe mailer ...` —— 让打包后的 exe 反过来当发信脚本用。
+
+    单文件 exe 每次启动都要把自己解包一遍，发一封信多花一两秒，
+    换来的是「不依赖用户机器上装没装 Python」。这是打包后唯一的可靠路径。
+
+    踩过的坑：窗口模式（--windowed）的 exe 没有真正的控制台，
+    stdout / stderr 是无效句柄 —— 而 mailer 里任何一句输出或异常回溯
+    都会去写它，**一写就卡死**（实测进程挂着不退、任务文件也没被处理）。
+    所以这里先把三个标准流换成「黑洞」，再让脚本跑。
+    """
+    import runpy
+
+    class _Sink(object):
+        """能接住任何写入、且永远不报错的假流。"""
+
+        def write(self, *_a):
+            return 0
+
+        def writelines(self, *_a):
+            return None
+
+        def flush(self):
+            return None
+
+        def isatty(self):
+            return False
+
+        def fileno(self):
+            raise OSError("no fileno")
+
+    for name in ("stdout", "stderr", "stdin"):
+        try:
+            setattr(sys, name, _Sink() if name != "stdin" else _Sink())
+        except Exception:               # noqa: BLE001
+            pass
+
+    # 把 mailer 要用的模块在这里先导入一遍。
+    #
+    # 打包后 mailer.pyw 是「数据」，PyInstaller 静态分析看不到它的 import，
+    # 于是 exe 里可能缺 smtplib / email 这些模块 —— 一跑就 ModuleNotFoundError。
+    # 打包脚本里也有一份 --hidden-import 名单，两边都写是有意的：
+    # 名单写漏了，这里还能兜住；这里被删了，名单还能兜住。
+    # 发信是低频动作，先付一次导入成本，比「信寄不出去」划算太多。
+    try:
+        import smtplib      # noqa: F401
+        import ssl          # noqa: F401
+        import email        # noqa: F401
+        import email.message    # noqa: F401
+        import email.utils      # noqa: F401
+        import email.mime.text  # noqa: F401
+    except Exception:                   # noqa: BLE001
+        pass
+
+    args = [a for a in argv if a != "mailer"]
+    src = os.path.join(getattr(sys, "_MEIPASS", "") or "", MAILER_FILE)
+    if not os.path.exists(src):
+        src = os.path.join(script_home(), MAILER_FILE)
+    if not os.path.exists(src):
+        _mailer_error_log("找不到发信脚本：\n  _MEIPASS = %r\n  script_home() = %r\n  试过 = %r"
+                          % (getattr(sys, "_MEIPASS", None), script_home(),
+                             os.path.join(getattr(sys, "_MEIPASS", "") or "", MAILER_FILE)))
+        return 2
+    # 告诉 mailer 去哪儿读写任务与结果文件。
+    #
+    # 这一句是打包后最容易出错的地方：mailer.pyw 是脚本不是数据，
+    # 它读的是环境变量，拿不到就会退回到「自己所在的目录」——
+    # 而 exe 模式下它所在的目录是 _MEIPASS（那个用完就删的解包临时目录），
+    # 任务文件根本不在那儿，结果就是「发了信但永远没结果」。
+    # 主程序调用时本来就会带上这个变量（见 _spawn_mailer），
+    # 这里是给「手工敲 exe mailer」留的兜底。
+    if not os.environ.get("ANCIENT_COUNTDOWN_HOME"):
+        os.environ["ANCIENT_COUNTDOWN_HOME"] = script_home()
+    sys.argv = [src] + args
+    try:
+        runpy.run_path(src, run_name="__main__")
+        return 0
+    except SystemExit as exc:
+        # mailer 用 sys.exit(0/1/2) 汇报结果，正常路径
+        return int(exc.code or 0)
+    except BaseException:               # noqa: BLE001
+        # 窗口模式没有控制台，异常打出去也没人看得见 —— 落一份日志到旁边
+        import traceback
+        _mailer_error_log(traceback.format_exc())
+        return 1
+
+
+def _mailer_error_log(text):
+    """
+    发信进程出岔子时的落盘日志。
+
+    打包后的程序没有控制台，发信又是派生的隐藏进程 —— 一旦出错，
+    用户看到的现象只是「信没来」，没有任何线索。留一份日志在程序旁边，
+    排查时至少有东西可看。日志只保留最近一次，不会无限长大。
+    """
+    try:
+        path = os.path.join(DATA_DIR, "发信错误日志.txt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("时间: %s\n\n%s\n" % (_stamp(), text))
+    except Exception:                   # noqa: BLE001
+        pass
+
+
+def pythonw_executable():
+    """
+    找不带控制台窗口的解释器。
+
+    用户从命令行启动时 sys.executable 可能是 python.exe，直接派生子进程
+    会闪出一个黑框。这里换成旁边的 pythonw.exe。
+    """
+    return resolve_python()
+
+
+def _rule_label(days):
+    """通知规则的默认档位名。"""
+    try:
+        days = float(days)
+    except (TypeError, ValueError):
+        return "提醒"
+    if days <= 0:
+        return "时辰已到"
+    if days >= 1:
+        return "剩 %g 日" % days
+    hours = days * 24
+    if abs(hours - round(hours)) < 0.02:
+        return "剩 %d 时" % round(hours)
+    return "剩 %.1f 时" % hours
+
+
+def looks_like_mail(addr):
+    """
+    粗校验邮箱地址的形状。
+
+    只做「一眼能看出错」的判断，不追求符合 RFC —— 真伪最终由邮件服务器裁定。
+    但少写一个点这种最常见的手误必须在这里拦下：放过去的话，
+    QQ 会直接把连接掐断，使用者看到的是一句英文，根本联想不到是自己打错了。
+
+    注意：mailer.pyw 里有同名同逻辑的一份。发信脚本要能独立运行，
+    不能反过来 import 主程序，所以这份重复是有意留的，改一处要记得改两处。
+    """
+    addr = (addr or "").strip()
+    if not addr or " " in addr or addr.count("@") != 1:
+        return False
+    local, _, domain = addr.partition("@")
+    if not local or not domain:
+        return False
+    if "." not in domain or domain.startswith(".") or domain.endswith("."):
+        return False
+    return True
+
+
+def machine_name():
+    """
+    本机名 —— 用来在收件箱里分辨信是哪台电脑寄出的。
+
+    优先读 COMPUTERNAME（就是「网上邻居 / 系统属性」里显示的那个名字），
+    取不到再退 socket.gethostname()。两者都拿不到时给个中性词，
+    总之不返回空串，免得抬头变成「【】」这种半吊子样子。
+    """
+    for key in ("COMPUTERNAME", "HOSTNAME"):
+        name = (os.environ.get(key) or "").strip()
+        if name:
+            return name
+    try:
+        import socket
+        name = (socket.gethostname() or "").strip()
+        if name:
+            return name
+    except Exception:                 # noqa: BLE001
+        pass
+    return "本机"
+
+
+def sanitize_signature(text):
+    """
+    净化抬头。换行必须去掉 —— 抬头会进邮件的 From 和 Subject，
+    里面混进 \\r\\n 就等于让使用者往邮件头里注入任意字段。
+    """
+    return (text or "").replace("\r", "").replace("\n", "").strip()
+
+
+def build_notify_task(nd, secret, token, subject, body, recipient, from_name=""):
+    """
+    拼出交给 mailer 的任务文件内容 —— 任务文件的形状只有这一处定义。
+
+    为什么要抽成函数：早先 _spawn_mailer 写的是 task["smtp"]["user"]，
+    而 mailer 那边读的是 task["user"]，两边各自看都自洽，
+    合起来却抛 KeyError('user')。把「写」的一方收拢成唯一来源，
+    测试只要拿这个函数的产出喂给 mailer，接口对不上就瞒不住了。
+    """
+    nd = nd or {}
+    return {
+        "token": token,
+        "smtp": {
+            "host": (nd.get("host") or "").strip(),
+            "port": int(nd.get("port") or 465),
+            "use_ssl": bool(nd.get("use_ssl", True)),
+            "user": (nd.get("user") or "").strip(),
+            "password": ((secret or {}).get("smtp_password") or "").strip(),
+        },
+        "to": (recipient or "").strip(),
+        # 抬头：mailer 拿它当发件人的显示名，收件箱里一眼能看出是哪台机器
+        "from_name": sanitize_signature(from_name),
+        "subject": subject,
+        "body": body,
+    }
+
+
+def hex_to_rgb(color):
+    color = (color or "#000000").lstrip("#")
+    if len(color) == 3:
+        color = "".join(ch * 2 for ch in color)
+    try:
+        return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return (0, 0, 0)
+
+
+def mix(c1, c2, ratio):
+    """在两色之间插值，ratio=0 取 c1，ratio=1 取 c2。"""
+    a, b = hex_to_rgb(c1), hex_to_rgb(c2)
+    return "#%02X%02X%02X" % tuple(
+        max(0, min(255, round(a[i] + (b[i] - a[i]) * ratio))) for i in range(3)
+    )
+
+
+def shichen_name(hour):
+    """把 24 小时制小时换算成十二时辰。"""
+    return CN_SHICHEN[((hour + 1) // 2) % 12]
+
+
+def pretty_target(dt):
+    """把 datetime 渲染成古风写法，例如「十月初一 · 午时」。"""
+    if not dt:
+        return "尚未设定"
+    return "%s%s · %s时" % (CN_MONTHS[dt.month - 1], CN_DAYS[dt.day], shichen_name(dt.hour))
+
+
+def _time_error(hour, minute):
+    """报错时把用户原样写的数字带回给他，别让他自己回去数第几段填错了。"""
+    return "时间需在 0 ~ 23 时 0 ~ 59 分之间，你写的是 %d 时 %d 分" % (hour, minute)
+
+
+def _lenient(hour, minute, second):
+    """宽松读法：时/分/秒越界时退回 0。
+
+    只有一个场景配用这种读法：**整条输入凑巧能解释成「年份 + 月日时分」**，
+    也就是必须动用"第一位是年份"才能读通的时候。
+      "10.1.8.5"  月份 10 读法读不通（时分是 8:5 但第二位 5 越界？不，是月1日8:5
+                  看着也通）—— 真正需要它的是 "10.1.11.30" 被误当年份后的兜底。
+    普通输入（"10.1 24"）绝不宽松：时 24 就是写错了，必须报错。
+    否则用户把 24 点敲进去，程序会默默改成 0 点，倒计时差一整天。
+    """
+    return (hour if 0 <= hour <= 23 else 0,
+            minute if 0 <= minute <= 59 else 0,
+            second if 0 <= second <= 59 else 0)
+
+
+def _resolve_year(month, day, hour, minute, second, now, noisy):
+    """年份确定的两种收尾，区别只在「读不通时怎么办」。
+
+    不写年份时，挑「下一个还没到的」那一年（含今年）。
+    """
+    if noisy:
+        for y in (now.year, now.year + 1, now.year + 2):
+            try:
+                candidate = datetime.datetime(y, month, day, hour, minute, second)
+            except ValueError:
+                continue                   # 例：2月29日在平年不存在，跳到闰年
+            if candidate > now:
+                return candidate, None
+        return None, "在接下来三年内找不到该日期，请检查月日"
+
+    for y in (now.year, now.year + 1, now.year + 2):
+        try:
+            candidate = datetime.datetime(y, month, day, hour, minute, second)
+        except ValueError:
+            continue
+        if candidate > now:
+            return candidate, None
+    # 整条输入都不成立时才明确报错 —— 到这一步说明月份、日期都越界了
+    if not 1 <= month <= 12:
+        return None, "在接下来三年内找不到该日期，请检查月日"
+    return None, "在接下来三年内找不到该日期，请检查月日"
+
+
+def parse_target(text, now=None):
+    """
+    解析目标时刻 —— 只认数字，数字之间填什么当分隔都行。
+
+        "10.1.11.30"        10月1日 11:30
+        "10 1 2  32"        同上（空格、点半角全角、逗号斜杠破折号一概当分隔）
+        "10.1/2，32"        同上
+        "2026.10.1.11.30"   显式指定年份
+        "26.10.1"           年份写两位也行
+
+    依次按 [年?] 月 日 时 分 秒 读；少写尾巴就是 0，所以 "10.1" 是当日零点。
+    返回 (datetime | None, 错误提示 | None)
+    未指定年份时，自动选择「下一个尚未到来的」那一年。
+    """
+    now = now or datetime.datetime.now()
+
+    raw = str(text or "").strip()
+    if not raw:
+        return None, "请输入目标时间，例如 10.1.11.30"
+
+    # 非数字一律当分隔符：空格、制表、换行、点半角「.」。全角「．」、
+    # 逗号、顿号、斜杠、破折号、下划线、冒号、中文年月日……全都不用特判。
+    # 中英文标点在 Unicode 里都不属于 \w，所以一条 \d+ 就够了。
+    nums = re.findall(r"\d+", raw)
+
+    # 一个数字都没找到。这一条必须在取 nums[0] 之前挡掉 ——
+    # 否则一行 "abc" 就能让整个程序崩掉（实测撞过 IndexError）。
+    if not nums:
+        return None, "没找到数字。至少要写月和日，例如 10.1"
+
+    # 写死一个数没意义。这不是"分隔符问题"而是少了信息，所以单独说清楚，
+    # 免得用户对着「例如 10.1.11.30」反复琢磨自己是不是敲错了标点。
+    if len(nums) == 1:
+        return None, "只有一个数字「%s」，看不出是什么，至少要写月和日，例如 10.1" % nums[0]
+
+    # 三种读法，顺序就是**优先级**，这一点是这段逻辑的命门：
+    #   ① plain   第一位是月份（最常用、也最该优先）
+    #   ② year4   第一位是四位年份
+    #   ③ year2   第一位是两位年份
+    #
+    # 为什么"月份"必须排在"两位年份"前面 —— 这是实测踩出来的：
+    #   "13.1"     → 用户想写 13 月（明显是想打 1 月 3 日或手误）。
+    #                若 year2 优先，会读出 2013年1月1日 —— 一个完全不相干的日子，
+    #                而且不报错！用户得看到"✓ 2013年…"才发现不对。
+    #   "10.1 24"  → 用户想写 24 点。若 year2 优先，会读出 2010年1月24日。
+    # 只有当"按月份读"根本读不通时，才轮到年份出场（例如 "26.10.1"）——
+    # 那时 plain 读法会因 26 > 12 作废，year2 自然接上。
+    # 顺带一个好处："13.1" 会正常报「月份需在 1~12 之间」，
+    # 比给出一个看似合理的错误日期好得多。
+    #
+    # 曾经还试过第四条「month2」：把个位数开头猜成"月份漏了首位"，
+    # 让 "1 10" 读成 1月10日。实测证明是个坏主意 ——
+    # "10.1 24" 会被它猜成 2010年1月24日、"13.1" 猜成 2013年1月1日。
+    # 它只是把年份那张错答案换了个样子。删掉。
+    vals = [int(n) for n in nums]
+
+    readings = []
+    if len(nums[0]) == 4:
+        readings.append(("year4", vals[0], vals[1:]))
+    readings.append(("plain", None, vals))
+    if len(nums[0]) == 2:
+        y2 = 2000 + vals[0]
+        # 两位年份只在「离当年足够近」时才算数。
+        #
+        # 为什么加这道门槛 —— 这是实测撞出来的最危险的一类错：
+        #   "13.1"    用户想写 13 月。按 2013 年读会得到 2013年1月1日，
+        #             **不报错**，用户得盯着预览才发现日子完全不对。
+        #   "10.1 24" 用户想写 24 点。按 2010 年读会得到 2010年1月24日。
+        # 这两条里年份读法只是"碰巧合法"，它给出的答案离用户本意十万八千里。
+        # 而"写两位年份"这个动作本身意味着「就是近些年」——
+        # 正常人不会用两位写一个十六年前的年份。所以窗口取 ±8 年。
+        # 挡掉之后，"13.1" 会落到错误提示「月份需在 1~12 之间」，
+        # 比一个看着合理的错误日期好得多。
+        if now.year - 8 <= y2 <= now.year + 8:
+            readings.append(("year2", y2, vals[1:]))
+
+    for kind, year, rest in readings:
+        if not rest:
+            continue
+        mo, dy = rest[0], (rest[1] if len(rest) > 1 else 1)
+        hr = rest[2] if len(rest) > 2 else 0
+        mi = rest[3] if len(rest) > 3 else 0
+        se = rest[4] if len(rest) > 4 else 0
+        sane = (1 <= mo <= 12 and 1 <= dy <= 31
+                and 0 <= hr <= 23 and 0 <= mi <= 59 and 0 <= se <= 59)
+
+        if kind in ("year4", "year2"):
+            # 年份读法必须**整条都合法**才成立。否则 "2026.2.29" 这种
+            # 不存在的日期会被当成"年份 2026 + 月 2 + 日 29 读不通"，
+            # 然后错误地回落到把 2026 当月份。
+            if not sane:
+                continue
+            try:
+                return datetime.datetime(year, mo, dy, hr, mi, se), None
+            except ValueError:
+                continue
+
+        # 时/分/秒越界只有**年份读法**才有资格宽容一次：
+        # "10.1 11 30" 按月份读是 10月1日 11:30（成立）；
+        # 按年份读是 2010年1月11日 30分（30 分越界）。
+        # 宽松是为了让"年份这条读法"不至于把整条输入拖死，
+        # 绝不能让普通读法也宽容 —— 那会把 "3.1 24" 的 24 点悄悄改成 0 点。
+        if not sane:
+            if kind == "year2":
+                hr, mi, se = _lenient(hr, mi, se)
+            else:
+                continue
+
+        # 月份/日越界：这条读法作废
+        if not (1 <= mo <= 12 and 1 <= dy <= 31):
+            continue
+
+        got, _ = _resolve_year(mo, dy, hr, mi, se, now, noisy=False)
+        if got is not None:
+            return got, None
+
+    # 全试完了还是读不通 —— 这时才值得报错，并且尽量指出是哪一段越界。
+    # 注意要从「年份读法」之后的位置看：四位数开头说明第一位是年份，
+    # 那月份应该在 vals[1]。
+    idx = 1 if len(nums[0]) == 4 and len(vals) > 1 else 0
+    if not 1 <= vals[idx] <= 12:
+        return None, "月份需在 1 ~ 12 之间，你写的是 %d" % vals[idx]
+    if len(vals) > idx + 1 and not 1 <= vals[idx + 1] <= 31:
+        return None, "日期需在 1 ~ 31 之间，你写的是 %d" % vals[idx + 1]
+    if len(vals) > idx + 2 and not 0 <= vals[idx + 2] <= 23:
+        return None, _time_error(vals[idx + 2], vals[idx + 3] if len(vals) > idx + 3 else 0)
+    if len(vals) > idx + 3 and not 0 <= vals[idx + 3] <= 59:
+        return None, _time_error(vals[idx + 2], vals[idx + 3])
+    if len(vals) > idx + 4 and not 0 <= vals[idx + 4] <= 59:
+        return None, "秒需在 0 ~ 59 之间，你写的是 %d" % vals[idx + 4]
+    return None, "「%s」不是个成立的日期，请检查月日" % raw
+
+
+def pick_theme(remaining_seconds, cfg):
+    """
+    根据剩余秒数挑出当前配色。
+    规则按 days 升序排列，第一个满足「剩余 <= 阈值」的就是最紧迫的一档。
+    """
+    pal = cfg["palette"]
+    rules = []
+    for item in cfg.get("thresholds", []):
+        try:
+            days = float(item.get("days"))
+        except (TypeError, ValueError):
+            continue
+        rules.append((days, item))
+    rules.sort(key=lambda pair: pair[0])
+
+    for days, item in rules:
+        if remaining_seconds <= days * 86400.0:
+            return {
+                "fg": (item.get("color") or pal["default_fg"]).strip(),
+                "bg": (item.get("bg") or pal["paper"]).strip(),
+                "bg_explicit": bool(item.get("bg")),
+                "label": item.get("label") or "",
+            }
+    return {"fg": pal["default_fg"], "bg": pal["paper"],
+            "bg_explicit": False, "label": ""}
+
+
+# --------------------------------------------------------------------------
+# 主窗口
+# --------------------------------------------------------------------------
+
+class CountdownApp:
+
+    def __init__(self):
+        self.cfg = load_config()
+        self.target, self.parse_err = parse_target(self.cfg.get("target"))
+
+        self.remaining = None
+        self.zero_mode = False
+        self.theme = None
+        self.blink = False
+        self._last_text = None
+
+        # 传书状态：这里只持有内存里的引用，不读文件也不发网络请求，
+        # 所以对启动速度和常驻占用都没有影响
+        self.secret = load_notify_secret()
+        self.notify_state = load_notify_state()
+        self._last_notify_check = 0.0
+        self._notify_note = ""          # 最近一次传书结果，说给用户听
+        self._notify_note_at = 0.0
+
+        # 字号缓存：字体切换在 Tk 中约 8ms，必须避免每秒重新试错
+        self._digits_key = None
+        self._digits_size = 100
+        self._zero_key = None
+        self._zero_size = 100
+
+        self.gear_hover = False
+        self._settings = None
+
+        self.root = tk.Tk()
+        self.root.title(APP_NAME)
+        self.root.overrideredirect(True)               # 无系统边框，纯自绘
+        pal = self.cfg["palette"]
+        self.root.configure(bg=pal["ink"])
+        self.root.attributes("-topmost", bool(self.cfg.get("always_on_top", True)))
+
+        self.canvas = tk.Canvas(self.root, highlightthickness=0, bd=0,
+                                bg=pal["paper"], cursor="fleur")
+        self.canvas.pack(fill="both", expand=True)
+
+        # 状态变量：必须先于 _place_window 初始化。
+        # 否则刚算好的位置和尺寸会被下面几行覆盖成 0 —— 命中判定随之失效
+        # （点哪儿都被当成拖边缘）、拖拽再基于 (0,0,0,0) 去算，越拖越负，
+        # 最终把窗口丢到屏幕外并写进配置文件。
+        self.W = self.H = 0
+        self.x = self.y = 0
+        self.w = self.h = 0
+        self._drag_mode = ""
+        self._press_pt = (0, 0)
+        self._press_geo = (0, 0, 0, 0)
+        self._dragging = False
+
+        self._build_fonts()
+        self._place_window()
+
+        self._bind_events()
+        self._build_menu()
+
+        self.root.update_idletasks()
+        self.layout()
+        self.tick()
+
+    # ---------------- 初始化 ----------------
+
+    def _build_fonts(self):
+        available = set(tkfont.families())
+
+        def pick(candidates, fallback):
+            for name in candidates:
+                if name in available:
+                    return name
+            return fallback
+
+        # 中文：楷体最有书卷气；数字：衬线体（Georgia / Cambria）配楷体很协调
+        self.fam_cn = pick(["楷体", "KaiTi", "华文楷体", "STKaiti", "仿宋", "FangSong", "宋体"],
+                           "Microsoft YaHei")
+        self.fam_num = pick(["Georgia", "Cambria", "Times New Roman", "Constantia"],
+                            "Times New Roman")
+
+        self.f_title = tkfont.Font(family=self.fam_cn, size=15)
+        self.f_num = tkfont.Font(family=self.fam_num, size=72, weight="bold")
+        self.f_unit = tkfont.Font(family=self.fam_cn, size=24, weight="bold")
+        self.f_seal = tkfont.Font(family=self.fam_cn, size=15, weight="bold")
+        self.f_seal_small = tkfont.Font(family=self.fam_cn, size=9)
+        self.f_gear = tkfont.Font(family=self.fam_cn, size=12)
+        self.f_hint = tkfont.Font(family=self.fam_cn, size=11)
+        self.f_zero = tkfont.Font(family=self.fam_cn, size=64, weight="bold")
+
+    # ---- 位置合法性 ----
+
+    def default_position(self):
+        """默认落点：主屏右上角，留一点边距。"""
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        return max(0, sw - self.w - 80), max(0, int(sh * 0.14))
+
+    def visible_area(self, x, y, w=None, h=None):
+        """窗口落在真实桌面范围内的可见宽高。"""
+        w = self.w if w is None else w
+        h = self.h if h is None else h
+        vl, vt, vr, vb = screen_rect(self.root)
+        return (max(0, min(x + w, vr) - max(x, vl)),
+                max(0, min(y + h, vb) - max(y, vt)))
+
+    def clamp_position(self, x, y, w=None, h=None):
+        """
+        把窗口拉回桌面：保证至少露出 MIN_VISIBLE_W × MIN_VISIBLE_H。
+        返回 (x, y, 是否发生修正)。位置本来就合法时原样返回。
+        """
+        w = self.w if w is None else w
+        h = self.h if h is None else h
+        vw, vh = self.visible_area(x, y, w, h)
+        if vw >= MIN_VISIBLE_W and vh >= MIN_VISIBLE_H:
+            return int(x), int(y), False
+        vl, vt, vr, vb = screen_rect(self.root)
+        # 只动越界的那一个方向，尽量保住用户原本的摆放意图
+        nx = min(max(x, vl), max(vl, vr - w))
+        ny = min(max(y, vt), max(vt, vb - h))
+        return int(nx), int(ny), True
+
+    def _place_window(self):
+        win = self.cfg.get("window", {})
+        vl, vt, vr, vb = screen_rect(self.root)
+        # 尺寸同样要校验：换到更小的屏幕后，旧的大尺寸也会把窗口撑出可视区
+        self.w = min(max(MIN_W, int(win.get("w") or 620)), max(MIN_W, vr - vl))
+        self.h = min(max(MIN_H, int(win.get("h") or 300)), max(MIN_H, vb - vt))
+
+        x, y = win.get("x"), win.get("y")
+        if x is None or y is None:
+            x, y = self.default_position()
+        else:
+            # 存档坐标未必还成立：显示器换过、分辨率改过，
+            # 或者上一次就是被拖到屏幕外才退出的。
+            x, y, rescued = self.clamp_position(int(x), int(y))
+            if rescued:
+                # 已经不可见了，就别再贴到某个边缘——那个位置用户从没选过，
+                # 直接回到明确的默认落点，免得他满屏幕找窗口。
+                x, y = self.default_position()
+
+        self.x, self.y = int(x), int(y)
+        self.cfg.setdefault("window", {})
+        self.cfg["window"].update({"x": self.x, "y": self.y})
+        save_config(self.cfg)
+        set_geometry(self.root, self.w, self.h, self.x, self.y)
+
+    def _bind_events(self):
+        c = self.canvas
+        c.bind("<Button-1>", self._on_press)
+        c.bind("<B1-Motion>", self._on_drag)
+        c.bind("<ButtonRelease-1>", self._on_release)
+        c.bind("<Motion>", self._on_hover)
+        c.bind("<Double-Button-1>", lambda e: self.open_settings())
+        c.bind("<Button-3>", self._popup_menu)
+        c.bind("<Configure>", self._on_configure)
+        self.root.bind("<Escape>", lambda e: self.close_settings())
+
+    def _build_menu(self):
+        pal = self.cfg["palette"]
+        self.menu = tk.Menu(self.root, tearoff=0,
+                            bg=pal["paper"], fg=pal["ink"],
+                            activebackground=pal["seal"], activeforeground="#FFF8EC",
+                            bd=1, relief="solid", font=(self.fam_cn, 10))
+        self._refresh_menu()
+
+    def _refresh_menu(self):
+        m = self.menu
+        m.delete(0, "end")
+        m.add_command(label="　　设置…", command=self.open_settings)
+        m.add_separator()
+        m.add_command(label=("　　✓ 锁定窗口尺寸" if self.cfg.get("locked") else "　　　锁定窗口尺寸"),
+                      command=self.toggle_lock)
+        m.add_command(label=("　　✓ 窗口总在最前" if self.cfg.get("always_on_top") else "　　　窗口总在最前"),
+                      command=self.toggle_topmost)
+        m.add_command(label="　　恢复默认大小", command=self.reset_size)
+        m.add_command(label="　　拉回屏幕", command=self.reset_position)
+        m.add_separator()
+        m.add_command(label="　　退出", command=self.quit_app)
+
+    def _popup_menu(self, event):
+        self._refresh_menu()
+        try:
+            self.menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.menu.grab_release()
+
+    # ---------------- 绘制 ----------------
+
+    def _on_configure(self, event):
+        if event.widget is not self.canvas:
+            return
+        if (event.width, event.height) == (self.W, self.H):
+            return
+        self.W, self.H = event.width, event.height
+        self.layout()
+
+    # ---- 底色感知的墨色 ----
+
+    def _is_dark_bg(self):
+        r, g, b = hex_to_rgb(self.bg_color)
+        return (0.299 * r + 0.587 * g + 0.114 * b) / 255.0 < 0.5
+
+    def _ink_tone(self, level="soft"):
+        """
+        返回在当前底色上可读的墨色。
+        底色偏亮时用墨色系，底色转深（例如「入夜」档）时自动换成纸色系，
+        这样同一套装饰元素在明暗两种底上都不会消失。
+        level: "strong"（正文）/ "soft"（标题）/ "faint"（辅助）
+        """
+        pal = self.cfg["palette"]
+        heavy, light = pal["ink"], pal["paper"]
+        ratio = {"strong": 0.0, "soft": 0.28, "faint": 0.52}.get(level, 0.28)
+        anchor = heavy if not self._is_dark_bg() else light
+        other = light if anchor == heavy else heavy
+        return mix(anchor, other, ratio)
+
+    def layout(self):
+        """整幅重绘（窗口尺寸变化 / 配色切换时调用）。"""
+        if getattr(self, "_in_layout", False):
+            return
+        self._in_layout = True
+        try:
+            self._layout_impl()
+        finally:
+            self._in_layout = False
+
+    def _layout_impl(self):
+        W = self.W or self.canvas.winfo_width() or self.w
+        H = self.H or self.canvas.winfo_height() or self.h
+        self.W, self.H = W, H
+
+        pal = self.cfg["palette"]
+        if self.remaining is None or self.target is None:
+            bg = pal["paper"]
+        elif self.zero_mode:
+            bg = pal["paper_night"]
+        else:
+            bg = (self.theme or {}).get("bg") or pal["paper"]
+        self.bg_color = bg
+
+        self.canvas.delete("all")
+        self._draw_paper(W, H, bg)
+        self._draw_frame(W, H)
+        self._draw_gear(W, H)
+        self._draw_seal(W, H)
+        self._draw_head(W, H)
+        self.redraw_dynamic()
+
+    def _draw_paper(self, W, H, bg):
+        c = self.canvas
+        c.create_rectangle(0, 0, W, H, fill=bg, outline="")
+        # 宣纸纤维质感：固定随机种子，保证每次重绘纹理一致
+        rnd = random.Random(20261001)
+        count = max(24, int(W * H / 5200))
+        dark = mix(bg, "#000000", 0.10)
+        light = mix(bg, "#FFFFFF", 0.22)
+        for i in range(count):
+            px, py = rnd.uniform(0, W), rnd.uniform(0, H)
+            r = rnd.uniform(0.5, 1.8)
+            c.create_oval(px - r, py - r, px + r, py + r,
+                          fill=(dark if i % 3 else light), outline="")
+
+    def _draw_frame(self, W, H):
+        c = self.canvas
+        pal = self.cfg["palette"]
+        m = max(7, int(min(W, H) * 0.030))
+        c.create_rectangle(m, m, W - m, H - m,
+                           outline=pal["border"], width=2)
+        c.create_rectangle(m + 5, m + 5, W - m - 5, H - m - 5,
+                           outline=pal["border_soft"], width=1)
+        # 四角回纹角花
+        arm = max(10, int(min(W, H) * 0.048))
+        for ox, oy, sx, sy in ((m, m, 1, 1), (W - m, m, -1, 1),
+                               (m, H - m, 1, -1), (W - m, H - m, -1, -1)):
+            c.create_line(ox + sx * 3, oy + sy * arm, ox + sx * 3, oy + sy * 3,
+                          ox + sx * arm, oy + sy * 3,
+                          fill=pal["border"], width=2)
+            c.create_line(ox + sx * 7, oy + sy * (arm - 4), ox + sx * 7, oy + sy * 7,
+                          ox + sx * (arm - 4), oy + sy * 7,
+                          fill=pal["border_soft"], width=1)
+
+    def _draw_head(self, W, H):
+        """顶部古风标题：目标时刻 + 当前规则标签。"""
+        pal = self.cfg["palette"]
+        m = max(7, int(min(W, H) * 0.030))
+        size = max(9, min(16, int(H * 0.062)))
+        self.f_title.configure(size=size)
+
+        title = pretty_target(self.target) if self.target else "尚未设定目标时刻"
+        self.canvas.create_text(W / 2, m + size + 8, text=title,
+                                font=self.f_title,
+                                fill=self._ink_tone("soft"))
+
+        # 左下角：当前配色规则名
+        label = (self.theme or {}).get("label") or ""
+        if self.zero_mode:
+            label = ""
+        if label:
+            self.f_hint.configure(size=max(8, int(size * 0.78)))
+            self.canvas.create_text(m + 16, H - m - 14, text=label, anchor="w",
+                                    font=self.f_hint,
+                                    fill=self._ink_tone("faint"))
+
+    def _draw_gear(self, W, H):
+        """右上角「設」字入口。"""
+        pal = self.cfg["palette"]
+        m = max(7, int(min(W, H) * 0.030))
+        self.f_gear.configure(size=max(10, min(15, int(H * 0.058))))
+        self._gear_pos = (W - m - 20, m + 19)
+        color = pal["seal"] if self.gear_hover else self._ink_tone("faint")
+        self.canvas.create_text(*self._gear_pos, text="設", font=self.f_gear, fill=color)
+
+    def _draw_seal(self, W, H):
+        """右下角朱砂印。"""
+        pal = self.cfg["palette"]
+        m = max(7, int(min(W, H) * 0.030))
+        s = max(26, min(46, int(min(W, H) * 0.145)))
+        x1, y1 = W - m - 14 - s, H - m - 14 - s
+        self.canvas.create_rectangle(x1, y1, x1 + s, y1 + s,
+                                     fill=pal["seal"], outline="")
+        self.canvas.create_rectangle(x1 + 3, y1 + 3, x1 + s - 3, y1 + s - 3,
+                                     outline=mix(pal["seal"], "#FFFFFF", 0.35), width=1)
+        self.f_seal.configure(size=max(11, int(s * 0.46)))
+        # 印文固定用亮色（朱红印面之上），不随底色反转
+        self.canvas.create_text(x1 + s / 2, y1 + s / 2, text="時",
+                                font=self.f_seal, fill=mix(pal["paper"], "#FFFFFF", 0.12))
+
+    # ---- 动态部分（每次刷新重建，物品数很少，开销可忽略） ----
+
+    def redraw_dynamic(self):
+        self.canvas.delete("dyn")
+        if self.target is None:
+            self._draw_error()
+        elif self.zero_mode:
+            self._draw_zero()
+        else:
+            self._draw_digits()
+
+    def _region(self):
+        """数字可用区域 (left, top, right, bottom)。"""
+        m = max(7, int(min(self.W, self.H) * 0.030))
+        head = m + max(9, min(16, int(self.H * 0.062))) * 2 + 14
+        return (m + 30, head, self.W - m - 30, self.H - m - 26)
+
+    # ---- 字号拟合：比例估算 + 缓存，避免逐号试错 ----
+
+    def _apply_num_size(self, size):
+        self.f_num.configure(size=size)
+        self.f_unit.configure(size=max(8, int(size * 0.36)))
+
+    def _ensure_num_size(self, size):
+        unit_size = max(8, int(size * 0.36))
+        if int(self.f_num.cget("size")) != size or int(self.f_unit.cget("size")) != unit_size:
+            self._apply_num_size(size)
+
+    def _block_width(self, pairs, size, gap, grp):
+        total = 0
+        for num, unit, _ in pairs:
+            total += self.f_num.measure(num) + gap + self.f_unit.measure(unit)
+        return total + grp * (len(pairs) - 1)
+
+    def _fit_num_size(self, pairs, avail_w, avail_h):
+        """
+        按比例估算字号，再做几次几何收敛。
+
+        注意：在 Tk 中切换字体约需 8ms，若从大字号逐个往下试，
+        一轮排版会累积到数百毫秒；比例估算把字体切换次数压到 2~5 次。
+        """
+        probe = 100
+        self._apply_num_size(probe)
+        w0 = self._block_width(pairs, probe, max(5, int(probe * 0.26)),
+                               max(9, int(probe * 0.42)))
+        h0 = max(1, self.f_num.metrics("linespace"))
+        if w0 <= 0:
+            return probe
+
+        size = max(9, min(400, int(probe * min(avail_w / w0, avail_h / h0))))
+        for _ in range(5):
+            self._apply_num_size(size)
+            gap = max(5, int(size * 0.26))
+            grp = max(9, int(size * 0.42))
+            w = self._block_width(pairs, size, gap, grp)
+            h = self.f_num.metrics("linespace")
+            if w <= avail_w and h <= avail_h:
+                break
+            nxt = max(9, int(size * min(avail_w / max(1, w), avail_h / max(1, h)) * 0.97))
+            if nxt >= size:
+                nxt = size - 1
+            if nxt < 9:
+                size = 9
+                break
+            size = nxt
+
+        self._apply_num_size(size)
+        return size
+
+    def _fit_zero_size(self, text, avail_w, avail_h):
+        probe = 100
+        self.f_zero.configure(size=probe)
+        w0 = max(1, self.f_zero.measure(text))
+        h0 = max(1, self.f_zero.metrics("linespace"))
+
+        size = max(10, min(400, int(probe * min(avail_w / w0, avail_h / h0))))
+        for _ in range(5):
+            self.f_zero.configure(size=size)
+            w = self.f_zero.measure(text)
+            h = self.f_zero.metrics("linespace")
+            if w <= avail_w and h <= avail_h:
+                break
+            nxt = max(10, int(size * min(avail_w / max(1, w), avail_h / max(1, h)) * 0.97))
+            if nxt >= size:
+                nxt = size - 1
+            if nxt < 10:
+                size = 10
+                break
+            size = nxt
+
+        if int(self.f_zero.cget("size")) != size:
+            self.f_zero.configure(size=size)
+        return size
+
+    def _draw_digits(self):
+        c = self.canvas
+        pal = self.cfg["palette"]
+        rem = max(0.0, self.remaining or 0.0)
+        days = int(rem // 86400)
+        hours = int(rem % 86400 // 3600)
+        mins = int(rem % 3600 // 60)
+        secs = int(rem % 60)
+
+        pairs = [(str(days), "日", False), ("%02d" % hours, "時", False),
+                 ("%02d" % mins, "分", False), ("%02d" % secs, "秒", True)]
+
+        left, top, right, bottom = self._region()
+        avail_w = max(60, right - left)
+        avail_h = max(30, bottom - top)
+
+        # 字号只取决于「可用空间 + 各数字的位数」。位数在绝大多数秒内不变，
+        # 因此缓存命中后每秒刷新不必再做任何字号度量。
+        key = (avail_w // 4, avail_h // 4, tuple(len(n) for n, _, _ in pairs))
+        if key != self._digits_key:
+            self._digits_key = key
+            self._digits_size = self._fit_num_size(pairs, avail_w, avail_h)
+        size = self._digits_size
+        self._ensure_num_size(size)
+
+        gap = max(5, int(size * 0.26))
+        grp = max(9, int(size * 0.42))
+        total = self._block_width(pairs, size, gap, grp)
+
+        fg = (self.theme or {}).get("fg") or pal["default_fg"]
+        fg_unit = mix(fg, self.bg_color, 0.28)
+        cy = (top + bottom) / 2.0
+
+        x = left + max(0.0, (avail_w - total) / 2.0)
+        for num, unit, is_sec in pairs:
+            nw = self.f_num.measure(num)
+            uw = self.f_unit.measure(unit)
+            c.create_text(x + nw / 2.0, cy, text=num, font=self.f_num,
+                          fill=fg, tags="dyn")
+            c.create_text(x + nw + gap, cy + size * 0.29, text=unit, anchor="w",
+                          font=self.f_unit, fill=fg_unit, tags="dyn")
+            x += nw + gap + uw + grp
+
+    def _draw_zero(self):
+        c = self.canvas
+        zone_color = self.cfg.get("zero_color", "#B03A2E")
+        alt = self.cfg.get("zero_color_alt", "#D9A13B")
+        color = alt if self.blink else zone_color
+        text = self.cfg.get("zero_text", "時辰已到")
+
+        left, top, right, bottom = self._region()
+        # 留出四周呼吸感，避免字形顶到边框
+        avail_w = max(60, (right - left) * 0.84)
+        avail_h = max(30, (bottom - top) * 0.80)
+
+        # 归零提示文字固定，同样走缓存，闪烁刷新时不再做字号度量
+        key = (avail_w // 4, avail_h // 4, text)
+        if key != self._zero_key:
+            self._zero_key = key
+            self._zero_size = self._fit_zero_size(text, avail_w, avail_h)
+        if int(self.f_zero.cget("size")) != self._zero_size:
+            self.f_zero.configure(size=self._zero_size)
+
+        c.create_text((left + right) / 2.0, (top + bottom) / 2.0, text=text,
+                      font=self.f_zero, fill=color, tags="dyn")
+
+    def _draw_error(self):
+        c = self.canvas
+        pal = self.cfg["palette"]
+        left, top, right, bottom = self._region()
+        msg = self.parse_err or "时间格式无法识别"
+        self.f_zero.configure(size=max(14, min(30, int((right - left) / max(6, len(msg)) * 1.7))))
+        c.create_text((left + right) / 2.0, (top + bottom) / 2.0, text="⚠ " + msg,
+                      font=self.f_zero, fill=pal["seal"], tags="dyn")
+
+    # ---------------- 计时核心 ----------------
+
+    def tick(self):
+        """
+        每帧只做极轻量的工作；不使用死循环，调度点对齐到下一个整秒，
+        因此空闲时 CPU 占用约等于 0。
+        """
+        now = datetime.datetime.now()
+
+        # 顺带看一眼有没有第二个实例在喊「现身」（一次文件 stat，开销可忽略）
+        if os.path.exists(wake_file_path()):
+            self._consume_wake()
+
+        # 传书巡检。每 30 秒才真跑一次 —— 中间那些秒只是一次减法比较，
+        # 在纳秒量级，实测不出与改造前的差别。
+        # 首次 tick 必然触发，相当于开机时补做一次「错过的提醒」。
+        clock = now.timestamp()
+        if clock - self._last_notify_check >= NOTIFY_CHECK_SEC:
+            self._last_notify_check = clock
+            self.notify_tick(now)
+
+        if self.target is None:
+            stamp = ("err", self.parse_err)
+            theme = None
+            need_redraw = stamp != self._last_text
+            idle = False
+        else:
+            self.remaining = (self.target - now).total_seconds()
+            self.zero_mode = self.remaining <= 0
+            idle = self.zero_mode
+            if idle:
+                self.blink = not self.blink
+                stamp = ("zero", self.blink)
+                need_redraw = True
+            else:
+                stamp = ("run", int(self.remaining))
+                need_redraw = stamp != self._last_text
+            theme = None if idle else pick_theme(self.remaining, self.cfg)
+
+        self._last_text = stamp
+
+        if theme != self.theme:
+            self.theme = theme
+            self.layout()
+        elif need_redraw:
+            self.redraw_dynamic()
+
+        if self.target is None:
+            delay = 1000
+        elif idle:
+            delay = TICK_IDLE_MS
+        else:
+            delay = max(30, 1000 - now.microsecond // 1000)
+        self.root.after(delay, self.tick)
+
+    # ---------------- 窗口拖拽 / 缩放 ----------------
+
+    def _geometry(self):
+        return self.x, self.y, self.w, self.h
+
+    def _apply_geometry(self, x, y, w, h):
+        self.x, self.y, self.w, self.h = int(x), int(y), int(w), int(h)
+        set_geometry(self.root, self.w, self.h, self.x, self.y)
+        self.W, self.H = self.w, self.h
+
+    def hit_test(self, px, py):
+        if self.cfg.get("locked"):
+            return ""
+        m = RESIZE_MARGIN
+        left, right = px <= m, px >= self.W - m
+        top, bottom = py <= m, py >= self.H - m
+        if top and left:
+            return "nw"
+        if top and right:
+            return "ne"
+        if bottom and left:
+            return "sw"
+        if bottom and right:
+            return "se"
+        if top:
+            return "n"
+        if bottom:
+            return "s"
+        if left:
+            return "w"
+        if right:
+            return "e"
+        return ""
+
+    def _on_hover(self, event):
+        if self._dragging:
+            return
+        on_gear = self._gear_pos and \
+            abs(event.x - self._gear_pos[0]) < 16 and abs(event.y - self._gear_pos[1]) < 16
+        if on_gear != self.gear_hover:
+            self.gear_hover = on_gear
+            self._draw_gear(self.W, self.H)
+
+        if on_gear:
+            self.canvas.configure(cursor="hand2")
+            return
+
+        mode = self.hit_test(event.x, event.y)
+        cursor = {"nw": "size_nw_se", "se": "size_nw_se",
+                  "ne": "size_ne_sw", "sw": "size_ne_sw",
+                  "n": "size_ns", "s": "size_ns",
+                  "w": "size_we", "e": "size_we"}.get(mode, "fleur")
+        self.canvas.configure(cursor=cursor)
+
+    def _on_press(self, event):
+        if self._gear_pos and abs(event.x - self._gear_pos[0]) < 16 \
+                and abs(event.y - self._gear_pos[1]) < 16:
+            self.open_settings()
+            return
+
+        mode = self.hit_test(event.x, event.y)
+        if not mode and self.cfg.get("locked"):
+            mode = ""            # 锁定态下仅允许移动
+        self._drag_mode = mode if mode else "move"
+        self._dragging = True
+        self._press_pt = (event.x_root, event.y_root)
+        self._press_geo = self._geometry()
+
+    def _on_drag(self, event):
+        if not self._dragging:
+            return
+        dx = event.x_root - self._press_pt[0]
+        dy = event.y_root - self._press_pt[1]
+        x, y, w, h = self._press_geo
+        mode = self._drag_mode
+
+        if mode == "move":
+            # 拖动时也受约束：不让窗口被推出桌面，从源头杜绝「存下越界坐标」
+            nx, ny, _ = self.clamp_position(x + dx, y + dy, w, h)
+            self._apply_geometry(nx, ny, w, h)
+            return
+
+        if "e" in mode:
+            w = max(MIN_W, w + dx)
+        if "s" in mode:
+            h = max(MIN_H, h + dy)
+        if "w" in mode:
+            new_w = max(MIN_W, w - dx)
+            x = x + (w - new_w)
+            w = new_w
+        if "n" in mode:
+            new_h = max(MIN_H, h - dy)
+            y = y + (h - new_h)
+            h = new_h
+        self._apply_geometry(x, y, w, h)
+
+    def _on_release(self, event):
+        if not self._dragging:
+            return
+        self._dragging = False
+        if self._drag_mode != "move":
+            self.W, self.H = self.w, self.h
+            self.layout()
+        self._remember_geometry()
+
+    def _remember_geometry(self):
+        win = self.cfg.setdefault("window", {})
+        snapshot = {"x": self.x, "y": self.y, "w": self.w, "h": self.h}
+        # 位置未变化时不写盘，避免拖动过程中频繁 IO
+        if all(win.get(k) == v for k, v in snapshot.items()):
+            return
+        win.update(snapshot)
+        save_config(self.cfg)
+
+    def reset_size(self):
+        self._apply_geometry(self.x, self.y, 620, 300)
+        self.W, self.H = self.w, self.h
+        self.layout()
+        self._remember_geometry()
+
+    def reset_position(self):
+        """把窗口挪回默认位置——万一它跑到屏幕外，靠这个救回来。"""
+        x, y = self.default_position()
+        self._apply_geometry(x, y, self.w, self.h)
+        self.root.deiconify()
+        self.root.lift()
+        self._remember_geometry()
+
+    def _consume_wake(self):
+        """另一个实例被启动了：用户想看见窗口，那就把自己挪回可见处。"""
+        clear_wake_file()
+        self.reset_position()
+
+    def toggle_lock(self):
+        self.cfg["locked"] = not self.cfg.get("locked", False)
+        save_config(self.cfg)
+        self._refresh_menu()
+
+    def toggle_topmost(self):
+        self.cfg["always_on_top"] = not self.cfg.get("always_on_top", True)
+        self.root.attributes("-topmost", bool(self.cfg["always_on_top"]))
+        save_config(self.cfg)
+        self._refresh_menu()
+
+    def quit_app(self):
+        self._remember_geometry()
+        self.root.destroy()
+
+    # ---------------- 鸿雁传书（邮件通知）----------------
+    #
+    # 分工很明确：主进程只判断「该不该寄」并派生一个短命进程，
+    # 真正的网络收发全在那个进程里完成。所以无论发信成功还是卡住，
+    # 主进程的内存和响应速度都不受影响。
+
+    def notify_configured(self):
+        """四处都齐了才谈得上寄信；缺一样就静默跳过，不打扰。"""
+        nd = self.cfg.get("notify") or {}
+        if not nd.get("enabled"):
+            return False
+        if not (nd.get("user") or "").strip():
+            return False
+        if not (nd.get("host") or "").strip():
+            return False
+        if not (self.secret.get("smtp_password") or "").strip():
+            return False
+        return True
+
+    def notify_recipient(self):
+        nd = self.cfg.get("notify") or {}
+        return (nd.get("to") or "").strip() or (nd.get("user") or "").strip()
+
+    def notify_signature(self):
+        """
+        本机抬头。留空 = 不加抬头，主题沿用「【倒计时】…」的老样子。
+
+        新版第一次运行会由 load_config 种入计算机名，所以正常情况下这里
+        拿到的是「DESKTOP-XXXX」这类名字，用户改过就是「书房台机」。
+        """
+        nd = self.cfg.get("notify") or {}
+        return sanitize_signature(nd.get("signature"))
+
+    def mail_subject(self, tail):
+        """
+        按本机抬头拼主题 —— 正式寄信和试寄共用这一个来源。
+
+        为什么要抽出来：早先试寄那条路自己硬编码了「【倒计时】试寄一封」，
+        结果抬头加好后，正式信带抬头、试寄不带 —— 而试寄恰恰是用户
+        唯一能先看到效果的地方，等于白改。同一件事有两个来源就迟早分叉。
+        """
+        sign = self.notify_signature()
+        if sign:
+            return "【%s】倒计时 · %s" % (sign, tail)
+        return "【倒计时】%s" % tail            # 没设抬头 = 与旧版逐字一致
+
+    def mail_footer(self):
+        """落款。有抬头就冠在最前，收件箱列表里一眼看出是哪台机器寄的。"""
+        sign = self.notify_signature()
+        tail = ("%s · 古风倒计时自动传书" % sign) if sign \
+            else "古风倒计时 · 自动传书"
+        return ["", "—— %s" % tail,
+                "这封信由桌面上的小工具自动寄出，不必回复。"]
+
+    def notify_tick(self, now):
+        """巡检一次：先把上次的结果收回来，再判断这次该不该寄。"""
+        self.collect_notify_result()
+
+        if not self.notify_configured() or self.target is None:
+            return
+
+        st = self.notify_state
+        key = self.target.strftime("%Y-%m-%dT%H:%M:%S")
+        if st.get("target_key") != key:
+            # 换了目标时刻 = 换了一件事。旧的发送履历必须作废，
+            # 否则新目标会被旧记录挡住，永远不通知。
+            st["target_key"] = key
+            st["history"] = []
+            save_notify_state(st)
+
+        remaining = (self.target - now).total_seconds()
+        # 顺手校准：邮件正文里的剩余时间取自这里。
+        # tick 里原本的赋值发生在本函数之后，不校准就会用上一秒的旧值。
+        self.remaining = remaining
+        rules = self.cfg["notify"].get("rules") or []
+
+        due = []
+        for idx, rule in enumerate(rules):
+            if not rule.get("enabled", True):
+                continue
+            try:
+                threshold = float(rule.get("days") or 0.0) * 86400.0
+            except (TypeError, ValueError):
+                continue
+            if remaining > threshold:
+                continue
+
+            # 注意：超时与重试一律用真实时钟（time.time）比较。
+            # 履历里的 at_ts / next_try 就是按真实时钟写的，
+            # 混用两套计时基准会在时间被改动时误判。
+            rec = self.find_notify_record(idx)
+            if rec is None:
+                due.append((threshold, idx, rule, "首次"))
+            elif rec.get("status") == "failed" \
+                    and int(rec.get("tries", 1)) < NOTIFY_MAX_RETRY \
+                    and time.time() >= float(rec.get("next_try", 0)):
+                due.append((threshold, idx, rule, "重试"))
+            elif rec.get("status") == "sending" \
+                    and time.time() - float(rec.get("at_ts", 0)) > NOTIFY_SENDING_TIMEOUT:
+                # 发信进程没回音（被杀掉、或系统休眠掐断了它）。
+                # 同样要退避，否则下一轮巡检立刻重发，成了连击。
+                rec["status"] = "failed"
+                rec["error"] = "发信进程没有回音，稍后会再试"
+                rec["next_try"] = time.time() + NOTIFY_RETRY_SEC
+                save_notify_state(st)
+
+        if not due:
+            return
+
+        # 只寄最紧迫的那一封。开机时若已跨过多档（例如关机三天后才开机），
+        # 三封一起补发就成了骚扰 —— 一封信讲清现状就够了。
+        due.sort(key=lambda item: item[0])
+        _, idx, rule, reason = due[0]
+        self.dispatch_notify(idx, rule, reason)
+
+        # 其余更宽松的档位记为「已错过」，不再补发
+        for _, other_idx, other_rule, other_reason in due[1:]:
+            if other_reason != "首次":
+                continue
+            self.upsert_notify_record(other_idx, {
+                "days": other_rule.get("days"),
+                "status": "skipped",
+                "error": "",
+                "at": _stamp(),
+            })
+        save_notify_state(st)
+
+    def find_notify_record(self, idx):
+        for rec in self.notify_state.get("history", []):
+            if rec.get("rule") == idx:
+                return rec
+        return None
+
+    def upsert_notify_record(self, idx, data):
+        hist = self.notify_state.setdefault("history", [])
+        for rec in hist:
+            if rec.get("rule") == idx:
+                rec.update(data)
+                return rec
+        rec = {"rule": idx}
+        rec.update(data)
+        hist.append(rec)
+        return rec
+
+    def compose_notify_mail(self, rule, reason):
+        left = max(0.0, self.remaining or 0.0)
+        human = _human_delta(left) if left > 0 else "已到时刻"
+        label = rule.get("label") or _rule_label(rule.get("days"))
+        clock_desc = self.target.strftime("%Y-%m-%d %H:%M") if self.target else "—"
+        target_desc = pretty_target(self.target) if self.target else "未设定"
+
+        # 抬头放在主题最前面：收件箱的列表会把长标题截断，
+        # 而「哪台机器寄的」正是最不该被截掉的信息；「倒计时」反倒可以靠后。
+        sign = self.notify_signature()
+        tail = label if left <= 0 else "还剩 %s（%s）" % (human, label)
+        subject = self.mail_subject(tail)
+        if reason == "重试":
+            subject = "[重发] " + subject
+
+        lines = ["你设下的时刻已经到了。"] if left <= 0 \
+            else ["距你设下的时刻，还有 %s。" % human]
+        lines += [
+            "",
+            "目标时刻　%s" % clock_desc,
+            "　对应　　%s" % target_desc,
+            "当前剩余　%s" % human,
+            "提醒档位　%s" % label,
+        ]
+        if sign:
+            lines.append("寄出机器　%s" % sign)
+        if reason == "重试":
+            lines.append("（这一封是重发，前一次没能寄出去）")
+        lines += self.mail_footer()
+        body = "\n".join(lines)
+        if len(body.encode("utf-8")) > NOTIFY_BODY_LIMIT:
+            body = body.encode("utf-8")[:NOTIFY_BODY_LIMIT].decode("utf-8", "ignore")
+        return subject, body
+
+    def _spawn_mailer(self, token, subject, body, test_mode=False):
+        """写任务文件 + 派生发信进程。返回 (是否成功, 失败说明)。"""
+        import subprocess      # 延迟导入：只有真要寄信时才付这份成本
+
+        nd = self.cfg.get("notify") or {}
+        task = build_notify_task(nd, self.secret, token, subject, body,
+                                 self.notify_recipient(), self.notify_signature())
+
+        ok, err = _save_json(NOTIFY_TASK_PATH, task)
+        if not ok:
+            return False, "任务文件写不进去：%s" % err
+
+        # 两条启动路径，见 mailer_target()：平时用解释器跑 .pyw；
+        # 打包后若 .pyw 没有好的关联程序，就让 exe 自己兼任发信脚本。
+        target, prefix = mailer_target()
+        if not target:
+            return False, "找不到发信脚本 %s" % MAILER_FILE
+        argv = [target] + prefix
+        if not prefix:
+            argv = [pythonw_executable(), target]
+        if test_mode:
+            argv.append("test")
+        flags = 0x08000000 if os.name == "nt" else 0      # CREATE_NO_WINDOW
+
+        # 用环境变量把「数据目录在哪」明确告诉发信进程。
+        #
+        # 不能指望它自己找到：打包后 exe 会把 mailer.pyw 解到临时目录跑，
+        # 脚本按「自己所在目录」去找任务文件就会落空 —— 现象是信发出去了、
+        # 但结果永远收不回来。演练（隔离目录）时更是必须传，
+        # 否则发信进程会去读真实配置里的路径。
+        env = dict(os.environ)
+        env["ANCIENT_COUNTDOWN_HOME"] = DATA_DIR
+        try:
+            subprocess.Popen(
+                argv,
+                cwd=DATA_DIR,
+                creationflags=flags,
+                close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+        except Exception as exc:                          # noqa: BLE001
+            try:
+                os.remove(NOTIFY_TASK_PATH)               # 里面含授权码，别留在盘上
+            except OSError:
+                pass
+            return False, "发信进程起不来：%s" % exc
+        return True, ""
+
+    def dispatch_notify(self, idx, rule, reason):
+        subject, body = self.compose_notify_mail(rule, reason)
+        token = "%s-%d-%d" % (_stamp("%H%M%S"), idx, random.randint(100, 999))
+
+        ok, err = self._spawn_mailer(token, subject, body)
+        if not ok:
+            self.set_notify_note("传书失败：" + err)
+            return False
+
+        prev = self.find_notify_record(idx) or {}
+        self.upsert_notify_record(idx, {
+            "days": rule.get("days"),
+            "status": "sending",
+            "token": token,
+            "at": _stamp(),
+            "at_ts": time.time(),
+            "reason": reason,
+            "tries": int(prev.get("tries", 0)) + 1,
+            "error": "",
+        })
+        save_notify_state(self.notify_state)
+        self.set_notify_note("正在传书…")
+        return True
+
+    def collect_notify_result(self):
+        """取回发信进程留下的结果。没有结果文件时只花一次文件判断。"""
+        if not os.path.exists(NOTIFY_RESULT_PATH):
+            return
+        data = _load_json(NOTIFY_RESULT_PATH, None)
+        try:
+            os.remove(NOTIFY_RESULT_PATH)
+        except OSError:
+            pass
+        if not isinstance(data, dict):
+            return
+
+        token = data.get("token")
+        rec = None
+        for item in self.notify_state.get("history", []):
+            if item.get("token") == token:
+                rec = item
+                break
+        if rec is None:
+            return
+
+        if data.get("ok"):
+            rec["status"] = "sent"
+            rec["error"] = ""
+            rec["sent_at"] = _stamp()
+            self.set_notify_note("传书已送达")
+        else:
+            message = (data.get("error") or "未知错误").strip()
+            rec["status"] = "failed"
+            rec["error"] = message
+            rec["next_try"] = time.time() + NOTIFY_RETRY_SEC
+            tries = int(rec.get("tries", 1))
+            if tries >= NOTIFY_MAX_RETRY:
+                self.set_notify_note("传书失败（已试 %d 次）：%s" % (tries, message[:48]))
+            else:
+                self.set_notify_note("传书失败，稍后重试：%s" % message[:48])
+        save_notify_state(self.notify_state)
+
+    def set_notify_note(self, text):
+        self._notify_note = text
+        self._notify_note_at = time.time()
+
+    def send_test_mail(self):
+        """试寄一封：不写履历，纯验证配置。返回 (token, None) 或 (None, 错误)。"""
+        nd = self.cfg.get("notify") or {}
+        sender = (nd.get("user") or "").strip()
+        if not sender:
+            return None, "请先填写发件邮箱"
+        if not looks_like_mail(sender):
+            return None, "发件邮箱「%s」看着不完整，是不是少写了一个点" % sender
+        if not (self.secret.get("smtp_password") or "").strip():
+            return None, "请先填写授权码"
+        if not (nd.get("host") or "").strip():
+            return None, "请先选择邮箱服务商"
+        rcpt = self.notify_recipient()
+        if not looks_like_mail(rcpt):
+            return None, "收件邮箱「%s」看着不完整，是不是少写了一个点" % rcpt
+
+        left = max(0.0, self.remaining or 0.0)
+        sign = self.notify_signature()
+        lines = [
+            "这是一封试寄的信，用来确认邮箱设置能不能正常寄出。",
+            "",
+            "如果收到了，就说明配置没问题。",
+            "",
+            "顺带报一下当前状态：",
+            "目标时刻　%s" % (self.target.strftime("%Y-%m-%d %H:%M") if self.target else "未设定"),
+            "当前剩余　%s" % (_human_delta(left) if left > 0 else "已到时刻"),
+        ]
+        if sign:
+            lines.append("寄出机器　%s" % sign)
+        # 落款、主题都走公共拼装 —— 试寄必须和正式信长得一模一样，
+        # 否则「试寄看着没问题、正式寄来却不同」比不带抬头更糟。
+        lines += self.mail_footer()
+        body = "\n".join(lines)
+        if len(body.encode("utf-8")) > NOTIFY_BODY_LIMIT:
+            body = body.encode("utf-8")[:NOTIFY_BODY_LIMIT].decode("utf-8", "ignore")
+        token = "test-%s" % _stamp("%H%M%S")
+        ok, err = self._spawn_mailer(token, self.mail_subject("试寄一封"), body,
+                                     test_mode=True)
+        if not ok:
+            return None, err
+        return token, None
+
+    def show_notify_log(self):
+        """摊开传书履历 —— 免得「到底寄出去没有」只能靠猜。"""
+        existing = getattr(self, "_log_win", None)
+        if existing is not None:
+            try:
+                existing.lift()
+                existing.deiconify()
+                return
+            except tk.TclError:
+                self._log_win = None
+
+        pal = self.cfg["palette"]
+        nd = self.cfg.get("notify") or {}
+        win = tk.Toplevel(self.root)
+        self._log_win = win
+        win.overrideredirect(True)
+        win.configure(bg=pal["border"])
+        win.attributes("-topmost", True)
+
+        body = tk.Frame(win, bg=pal["paper"])
+        body.pack(fill="both", expand=True, padx=3, pady=3)
+
+        head = tk.Frame(body, bg=pal["ink"], height=34)
+        head.pack(fill="x")
+        head.pack_propagate(False)
+        tk.Label(head, text="　传 书 记 录", bg=pal["ink"], fg=pal["paper"],
+                 font=(self.fam_cn, 11, "bold")).pack(side="left", padx=10)
+        closer = tk.Label(head, text="✕", bg=pal["ink"], fg=pal["border_soft"],
+                          font=("Segoe UI", 10), cursor="hand2", padx=12)
+        closer.pack(side="right", fill="y")
+
+        def shut(event=None):
+            self._log_win = None
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        closer.bind("<Button-1>", shut)
+        win.bind("<Escape>", shut)
+
+        wrap = tk.Frame(body, bg=pal["paper"])
+        wrap.pack(fill="both", expand=True, padx=18, pady=14)
+
+        if not nd.get("enabled"):
+            summary, tint = "传书未开启", pal["ink_soft"]
+        elif not self.notify_configured():
+            summary, tint = "传书已开启，但配置还缺东西", pal["seal"]
+        else:
+            summary, tint = "传书已开启　→　%s" % self.notify_recipient(), "#4F7A52"
+        tk.Label(wrap, text=summary, bg=pal["paper"], fg=tint,
+                 font=(self.fam_cn, 10, "bold"), anchor="w").pack(fill="x")
+
+        if self._notify_note:
+            tk.Label(wrap, text=self._notify_note, bg=pal["paper"], fg=pal["ink_soft"],
+                     font=(self.fam_cn, 9), anchor="w", wraplength=380,
+                     justify="left").pack(fill="x", pady=(4, 0))
+
+        tk.Frame(wrap, bg=pal["border_soft"], height=1).pack(fill="x", pady=10)
+
+        rules = nd.get("rules") or []
+        if not rules:
+            tk.Label(wrap, text="还没有设置提醒档位", bg=pal["paper"], fg=pal["ink_soft"],
+                     font=(self.fam_cn, 10), anchor="w").pack(fill="x")
+        for idx, rule in enumerate(rules):
+            rec = self.find_notify_record(idx) or {}
+            status = rec.get("status")
+            label = rule.get("label") or _rule_label(rule.get("days"))
+            if status == "sent":
+                mark, tint, when = "已寄出", "#4F7A52", rec.get("sent_at") or rec.get("at") or ""
+            elif status == "failed":
+                mark, tint, when = "寄送失败", pal["seal"], rec.get("at") or ""
+            elif status == "sending":
+                mark, tint, when = "寄送中…", pal["border"], rec.get("at") or ""
+            elif status == "skipped":
+                mark, tint, when = "已错过", pal["ink_soft"], rec.get("at") or ""
+            else:
+                mark, tint, when = "尚未触发", pal["ink_soft"], ""
+
+            row = tk.Frame(wrap, bg=pal["paper"])
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=label, bg=pal["paper"], fg=pal["ink"],
+                     font=(self.fam_cn, 10), width=10, anchor="w").pack(side="left")
+            tk.Label(row, text=mark, bg=pal["paper"], fg=tint,
+                     font=(self.fam_cn, 10), width=8, anchor="w").pack(side="left")
+            tk.Label(row, text=when[:16], bg=pal["paper"], fg=pal["ink_soft"],
+                     font=("Consolas", 9), anchor="w").pack(side="left")
+            if rec.get("error"):
+                tk.Label(wrap, text="　　" + rec["error"][:80], bg=pal["paper"],
+                         fg=pal["seal"], font=(self.fam_cn, 9), anchor="w",
+                         wraplength=380, justify="left").pack(fill="x")
+
+        if not nd.get("enabled"):
+            tk.Label(wrap, text="（打开设置即可开启传书）", bg=pal["paper"],
+                     fg=pal["border"], font=(self.fam_cn, 9),
+                     anchor="w").pack(fill="x", pady=(10, 0))
+
+        win.update_idletasks()
+        w = max(430, win.winfo_reqwidth())
+        h = win.winfo_reqheight()
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        set_geometry(win, w, h, (sw - w) // 2, max(20, (sh - h) // 3))
+
+    # ---------------- 设置面板 ----------------
+
+    def open_settings(self):
+        if self._settings is not None:
+            try:
+                self._settings.win.lift()
+                self._settings.win.deiconify()
+                return
+            except tk.TclError:
+                self._settings = None
+        self._settings = SettingsPanel(self)
+
+    def close_settings(self):
+        if self._settings is not None:
+            self._settings.close()
+
+    def apply_settings(self, target_text, thresholds, locked, topmost,
+                       notify_cfg=None, secret=None):
+        err = None
+        parsed, err = parse_target(target_text)
+        if parsed is None:
+            return err
+        self.cfg["target"] = target_text.strip()
+        self.cfg["thresholds"] = thresholds
+        self.cfg["locked"] = bool(locked)
+        self.cfg["always_on_top"] = bool(topmost)
+        self.root.attributes("-topmost", bool(topmost))
+        save_config(self.cfg)
+
+        # 传书设置：只有「影响寄信判断」的字段真的变了，才作废发送履历。
+        # 否则你一改配色就把提醒重发一遍，反而成了骚扰。
+        # 注意 signature（本机抬头）故意不在这张名单里：它只改信长什么样，
+        # 不改变「该不该寄」。改个名字就把所有档位重发一遍是纯骚扰。
+        if notify_cfg is not None:
+            old_nd = self.cfg.get("notify") or {}
+            watched = ("enabled", "rules", "user", "to", "host")
+            before = {k: json.dumps(old_nd.get(k), ensure_ascii=False, sort_keys=True)
+                      for k in watched}
+            self.cfg["notify"] = deep_merge(old_nd, notify_cfg)
+            after = {k: json.dumps(self.cfg["notify"].get(k), ensure_ascii=False, sort_keys=True)
+                     for k in watched}
+            if before != after:
+                self.notify_state["history"] = []
+                save_notify_state(self.notify_state)
+        if secret is not None:
+            self.secret = deep_merge(self.secret, secret)
+            save_notify_secret(self.secret)
+
+        self._refresh_menu()
+        self.target = parsed
+        self.parse_err = None
+        self.remaining = (self.target - datetime.datetime.now()).total_seconds()
+        self.zero_mode = self.remaining <= 0
+        self._last_text = None
+        self.theme = None
+        self._last_notify_check = 0.0      # 让下一轮巡检立刻用新设置重算一次
+        self.layout()
+        return None
+
+    def run(self):
+        self.root.mainloop()
+
+
+# --------------------------------------------------------------------------
+# 设置面板
+# --------------------------------------------------------------------------
+
+class SettingsPanel:
+    """古风配色设置面板（无系统边框，自绘标题栏）。"""
+
+    W = 470
+
+    def __init__(self, app):
+        self.app = app
+        pal = app.cfg["palette"]
+        self.pal = pal
+        self.rows = []          # [(frame, days_var, color_value, bg_value, widgets...)]
+        self.notify_rows = []   # [(days_var, on_var, row)] —— 传书提醒档位
+        self._color_popup = None
+        self._color_popup_for = None
+        self._scroll_y = None   # 滚轮挪窗口的位移基准；None = 下次以实际位置为准
+
+        self.win = tk.Toplevel(app.root)
+        self.win.overrideredirect(True)
+        self.win.configure(bg=pal["border"])
+        self.win.attributes("-topmost", True)
+
+        self.body = tk.Frame(self.win, bg=pal["paper"])
+        self.body.pack(fill="both", expand=True, padx=3, pady=3)
+
+        self._build_header()
+        self._build_form()
+        self._build_notify()
+        self._build_footer()
+
+        self.win.update_idletasks()
+        self._center()
+        self.win.bind("<Escape>", lambda e: self.close())
+        # 面板比屏幕高时还能靠滚轮上下挪（见 _wheel_scroll）
+        self.win.bind("<MouseWheel>", self._wheel_scroll)
+        self.entry.focus_set()
+
+    # ---- 结构 ----
+
+    def _build_header(self):
+        pal = self.pal
+        self.header = tk.Frame(self.body, bg=pal["ink"], height=38)
+        self.header.pack(fill="x")
+        self.header.pack_propagate(False)
+        tk.Label(self.header, text="　設 　置", bg=pal["ink"], fg=pal["paper"],
+                 font=(self.app.fam_cn, 12, "bold")).pack(side="left", padx=12)
+        close = tk.Label(self.header, text="✕", bg=pal["ink"], fg=pal["border_soft"],
+                         font=("Segoe UI", 11), cursor="hand2", padx=14)
+        close.pack(side="right", fill="y")
+        close.bind("<Button-1>", lambda e: self.close())
+        close.bind("<Enter>", lambda e: close.configure(bg=pal["seal"], fg="#FFF8EC"))
+        close.bind("<Leave>", lambda e: close.configure(bg=pal["ink"], fg=pal["border_soft"]))
+        self._drag_bind(self.header)
+
+    def _section(self, text):
+        wrap = tk.Frame(self.body, bg=self.pal["paper"])
+        wrap.pack(fill="x", padx=18, pady=(14, 4))
+        tk.Label(wrap, text=text, bg=self.pal["paper"], fg=self.pal["ink"],
+                 font=(self.app.fam_cn, 11, "bold")).pack(side="left")
+        tk.Frame(wrap, bg=self.pal["border_soft"], height=1).pack(
+            side="left", fill="x", expand=True, padx=(10, 0), pady=(7, 0))
+        return wrap
+
+    def _build_form(self):
+        app, pal = self.app, self.pal
+
+        # --- 目标时间 ---
+        self._section("目标时刻")
+        box = tk.Frame(self.body, bg=pal["paper"])
+        box.pack(fill="x", padx=18)
+        self.entry = tk.Entry(box, font=(app.fam_num, 17, "bold"), justify="center",
+                              bg="#FFFBF2", fg=pal["ink"], relief="flat",
+                              insertbackground=pal["seal"],
+                              highlightthickness=1, highlightbackground=pal["border_soft"],
+                              highlightcolor=pal["seal"])
+        self.entry.pack(fill="x", ipady=7)
+        self.entry.insert(0, app.cfg.get("target", ""))
+        self.entry.bind("<KeyRelease>", lambda e: self._preview())
+        self.entry.bind("<Return>", lambda e: self._preview())
+
+        self.preview = tk.Label(self.body, text="", bg=pal["paper"], fg=pal["ink_soft"],
+                                font=(app.fam_cn, 10), anchor="w")
+        self.preview.pack(fill="x", padx=20, pady=(5, 0))
+
+        tk.Label(self.body, text="　格式：月.日.时.分　数字之间随便填什么都能认",
+                 bg=pal["paper"], fg=pal["border"], font=(app.fam_cn, 9),
+                 anchor="w").pack(fill="x", padx=18, pady=(3, 0))
+        tk.Label(self.body, text="　　　例：10.1.11.30 ／ 10.1 8 ／ 10.1/2，32 ／ 2026.10.1",
+                 bg=pal["paper"], fg=pal["border"], font=(app.fam_cn, 9),
+                 anchor="w").pack(fill="x", padx=18, pady=(1, 0))
+
+        # --- 颜色规则 ---
+        head = self._section("颜色规则")
+        tk.Label(head, text="剩余时间 ≤ 阈值时切换", bg=pal["paper"], fg=pal["ink_soft"],
+                 font=(app.fam_cn, 9)).pack(side="right")
+
+        self.rules = tk.Frame(self.body, bg=pal["paper"])
+        self.rules.pack(fill="x", padx=18)
+        for item in app.cfg.get("thresholds", []):
+            self._add_row(item.get("days"), item.get("color"), item.get("bg"))
+
+        add = tk.Label(self.body, text="＋  添加一条规则", bg=pal["paper"], fg=pal["border"],
+                       font=(app.fam_cn, 10), cursor="hand2", anchor="w")
+        add.pack(fill="x", padx=20, pady=(6, 0))
+        add.bind("<Button-1>", lambda e: self._add_row(1, "#B03A2E", None))
+        add.bind("<Enter>", lambda e: add.configure(fg=pal["seal"]))
+        add.bind("<Leave>", lambda e: add.configure(fg=pal["border"]))
+
+        # --- 窗口选项 ---
+        self._section("窗口")
+        self.var_lock = tk.BooleanVar(value=bool(app.cfg.get("locked")))
+        self.var_top = tk.BooleanVar(value=bool(app.cfg.get("always_on_top", True)))
+        for var, text in ((self.var_lock, "锁定窗口尺寸（禁止拖拽边缘缩放）"),
+                          (self.var_top, "窗口总在最前")):
+            tk.Checkbutton(self.body, text="  " + text, variable=var,
+                           bg=pal["paper"], fg=pal["ink"], selectcolor="#FFFBF2",
+                           activebackground=pal["paper"], activeforeground=pal["seal"],
+                           font=(app.fam_cn, 10), anchor="w", bd=0,
+                           highlightthickness=0).pack(fill="x", padx=20)
+
+        self._preview()
+
+    # ---- 传书设置 ----
+
+    def _build_notify(self):
+        app, pal = self.app, self.pal
+        nd = app.cfg.get("notify") or {}
+
+        head = self._section("传书 · 邮件提醒")
+        tk.Label(head, text="跨过档位即寄信", bg=pal["paper"], fg=pal["ink_soft"],
+                 font=(app.fam_cn, 9)).pack(side="right")
+
+        wrap = tk.Frame(self.body, bg=pal["paper"])
+        wrap.pack(fill="x", padx=18)
+
+        self.var_notify = tk.BooleanVar(value=bool(nd.get("enabled")))
+        tk.Checkbutton(wrap, text="  启用邮件提醒（关掉则只变色、不发信）",
+                       variable=self.var_notify, bg=pal["paper"], fg=pal["ink"],
+                       selectcolor="#FFFBF2", activebackground=pal["paper"],
+                       activeforeground=pal["seal"], font=(app.fam_cn, 10),
+                       anchor="w", bd=0, highlightthickness=0).pack(fill="x")
+
+        form = tk.Frame(wrap, bg=pal["paper"])
+        form.pack(fill="x", pady=(6, 0))
+
+        def field(label, value, masked=False):
+            row = tk.Frame(form, bg=pal["paper"])
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=label, bg=pal["paper"], fg=pal["ink_soft"],
+                     font=(app.fam_cn, 10), width=7, anchor="w").pack(side="left")
+            ent = tk.Entry(row, font=(app.fam_num, 10), bg="#FFFBF2", fg=pal["ink"],
+                           relief="flat", insertbackground=pal["seal"],
+                           highlightthickness=1, highlightbackground=pal["border_soft"],
+                           highlightcolor=pal["seal"],
+                           show=("●" if masked else ""))
+            ent.insert(0, value or "")
+            ent.pack(side="left", fill="x", expand=True, ipady=3)
+            return ent
+
+        # 服务商下拉：选好就把服务器地址带出来，省得用户记端口
+        row = tk.Frame(form, bg=pal["paper"])
+        row.pack(fill="x", pady=2)
+        tk.Label(row, text="邮箱服务", bg=pal["paper"], fg=pal["ink_soft"],
+                 font=(app.fam_cn, 10), width=7, anchor="w").pack(side="left")
+        self.var_provider = tk.StringVar(value=nd.get("provider") or "QQ 邮箱")
+        picker = tk.OptionMenu(row, self.var_provider, *PROVIDER_NAMES,
+                               command=self._on_provider)
+        picker.configure(bg="#FFFBF2", fg=pal["ink"], activebackground="#FFFBF2",
+                         font=(app.fam_cn, 10), highlightthickness=1, bd=0,
+                         relief="flat", anchor="w",
+                         highlightbackground=pal["border_soft"])
+        picker["menu"].configure(font=(app.fam_cn, 10), bg="#FFFBF2", fg=pal["ink"],
+                                 activebackground=pal["seal"], activeforeground="#FFF8EC")
+        picker.pack(side="left", fill="x", expand=True)
+
+        self.entry_user = field("发件邮箱", nd.get("user"))
+        self.entry_pass = field("授权码", (app.secret or {}).get("smtp_password"), masked=True)
+        self.entry_to = field("收件邮箱", nd.get("to"))
+        self.entry_sign = field("本机抬头", nd.get("signature"))
+        self.entry_host = field("服务器", nd.get("host"))
+
+        tk.Label(wrap, text="　授权码非登录密码，要在邮箱里单独申请；收件邮箱留空即发给自己",
+                 bg=pal["paper"], fg=pal["border"], font=(app.fam_cn, 9),
+                 anchor="w", justify="left", wraplength=434).pack(fill="x", pady=(2, 0))
+        tk.Label(wrap, text="　本机抬头用于分辨是哪台电脑寄的，会出现在发件人、主题前缀"
+                            "和正文落款三处；留空即不加。默认取计算机名「%s」"
+                            % machine_name(),
+                 bg=pal["paper"], fg=pal["border"], font=(app.fam_cn, 9),
+                 anchor="w", justify="left", wraplength=434).pack(fill="x", pady=(1, 0))
+
+        sub = tk.Frame(wrap, bg=pal["paper"])
+        # 上面那两行说明紧跟着服务器输入框，不留够空档会跟「提醒档位」粘在一起
+        sub.pack(fill="x", pady=(16, 0))
+        tk.Label(sub, text="提醒档位", bg=pal["paper"], fg=pal["ink"],
+                 font=(app.fam_cn, 10, "bold")).pack(side="left")
+        tk.Label(sub, text="剩余 ≤ 该天数时寄一封", bg=pal["paper"], fg=pal["ink_soft"],
+                 font=(app.fam_cn, 9)).pack(side="left", padx=(8, 0))
+
+        self.rule_box = tk.Frame(wrap, bg=pal["paper"])
+        self.rule_box.pack(fill="x")
+        for item in nd.get("rules") or []:
+            self._add_rule_row(item.get("days"), item.get("enabled", True))
+
+        adder = tk.Label(wrap, text="＋  添加一档", bg=pal["paper"], fg=pal["border"],
+                         font=(app.fam_cn, 10), cursor="hand2", anchor="w")
+        adder.pack(fill="x", pady=(4, 0), padx=(2, 0))
+        adder.bind("<Button-1>", lambda e: self._add_rule_row(1, True))
+        adder.bind("<Enter>", lambda e: adder.configure(fg=pal["seal"]))
+        adder.bind("<Leave>", lambda e: adder.configure(fg=pal["border"]))
+
+        bar = tk.Frame(wrap, bg=pal["paper"])
+        bar.pack(fill="x", pady=(10, 0))
+        self.test_btn = tk.Label(bar, text="试寄一封", bg=pal["paper"], fg=pal["ink"],
+                                 font=(app.fam_cn, 10), cursor="hand2",
+                                 padx=12, pady=3, highlightthickness=1,
+                                 highlightbackground=pal["border_soft"])
+        self.test_btn.pack(side="left")
+        self.test_btn.bind("<Button-1>", lambda e: self._test_send())
+        self.test_btn.bind("<Enter>", lambda e: self.test_btn.configure(fg=pal["seal"]))
+        self.test_btn.bind("<Leave>", lambda e: self.test_btn.configure(fg=pal["ink"]))
+
+        self.test_msg = tk.Label(bar, text="", bg=pal["paper"], fg=pal["ink_soft"],
+                                 font=(app.fam_cn, 9), anchor="w", justify="left",
+                                 wraplength=250)
+        self.test_msg.pack(side="left", padx=(10, 0))
+
+    def _on_provider(self, _value=None):
+        """换服务商就把服务器地址一并带出来。"""
+        host, _port, _ssl = self._provider_params(self.var_provider.get())
+        self.entry_host.delete(0, "end")
+        self.entry_host.insert(0, host)
+
+    def _provider_params(self, name):
+        for item in SMTP_PROVIDERS:
+            if item[0] == name:
+                return item[1], item[2], item[3]
+        return "", 465, True
+
+    def _add_rule_row(self, days, enabled=True):
+        pal = self.pal
+        row = tk.Frame(self.rule_box, bg=pal["paper"])
+        row.pack(fill="x", pady=2)
+
+        on = tk.BooleanVar(value=bool(enabled))
+        tk.Checkbutton(row, variable=on, bg=pal["paper"], activebackground=pal["paper"],
+                       selectcolor="#FFFBF2", bd=0,
+                       highlightthickness=0).pack(side="left")
+
+        tk.Label(row, text="剩余 ≤", bg=pal["paper"], fg=pal["ink_soft"],
+                 font=(self.app.fam_cn, 10)).pack(side="left")
+
+        days_var = tk.StringVar(value=("%g" % float(days)) if days is not None else "2")
+        ent = tk.Entry(row, textvariable=days_var, width=5, justify="center",
+                       font=(self.app.fam_num, 11, "bold"),
+                       bg="#FFFBF2", fg=pal["ink"], relief="flat",
+                       insertbackground=pal["seal"],
+                       highlightthickness=1, highlightbackground=pal["border_soft"],
+                       highlightcolor=pal["seal"])
+        ent.pack(side="left", padx=5, ipady=3)
+
+        tk.Label(row, text="天", bg=pal["paper"], fg=pal["ink_soft"],
+                 font=(self.app.fam_cn, 10)).pack(side="left")
+
+        record = {"days": days_var, "on": on, "row": row}
+        rm = tk.Label(row, text="✕", bg=pal["paper"], fg=pal["border_soft"],
+                      font=("Segoe UI", 10), cursor="hand2", padx=8)
+        rm.pack(side="right")
+        rm.bind("<Button-1>", lambda e: self._remove_rule_row(record))
+        rm.bind("<Enter>", lambda e: rm.configure(fg=pal["seal"]))
+        rm.bind("<Leave>", lambda e: rm.configure(fg=pal["border_soft"]))
+        self.notify_rows.append(record)
+
+    def _remove_rule_row(self, record):
+        if record in self.notify_rows:
+            self.notify_rows.remove(record)
+        try:
+            record["row"].destroy()
+        except tk.TclError:
+            pass
+
+    def _collect_notify(self):
+        rules = []
+        for rec in self.notify_rows:
+            raw = rec["days"].get().strip()
+            try:
+                days = float(raw)
+            except ValueError:
+                return None, "提醒档位要填天数，可带小数（0.5 即 12 小时）"
+            if days < 0:
+                return None, "提醒档位的天数不能为负"
+            rules.append({
+                "days": days,
+                "enabled": bool(rec["on"].get()),
+                "label": _rule_label(days),
+            })
+
+        provider = self.var_provider.get()
+        host, port, use_ssl = self._provider_params(provider)
+        host = self.entry_host.get().strip() or host
+
+        # 抬头要进 From 和 Subject，太长会把主题挤爆，也容易被邮件服务商判成
+        # 可疑标题；换行更是邮件头注入。两者都在这里挡掉。
+        sign = sanitize_signature(self.entry_sign.get())
+        if len(sign) > SIGNATURE_LIMIT:
+            return None, "本机抬头最多 %d 个字，现在的太长了" % SIGNATURE_LIMIT
+
+        cfg = {
+            "enabled": bool(self.var_notify.get()),
+            "provider": provider,
+            "host": host,
+            "port": port,
+            "use_ssl": use_ssl,
+            "user": self.entry_user.get().strip(),
+            "to": self.entry_to.get().strip(),
+            "signature": sign,
+            "rules": rules,
+        }
+        secret = {"smtp_password": self.entry_pass.get().strip()}
+        return (cfg, secret), None
+
+    def _test_send(self):
+        """拿面板里当下填的值试寄一封，不写盘也不动履历。"""
+        # 抬头先校验：试寄和正式寄必须同一套规矩，不然「试寄通过、保存被拒」
+        # 会让人以为是发信出了问题。
+        sign = sanitize_signature(self.entry_sign.get())
+        if len(sign) > SIGNATURE_LIMIT:
+            self.test_msg.configure(
+                text="✕ 本机抬头最多 %d 个字" % SIGNATURE_LIMIT, fg=self.pal["seal"])
+            return
+
+        nd = self.app.cfg.setdefault("notify", {})
+        # 试寄只「借用」面板里的值，寄完立刻还回去。
+        # 不还的后果很隐蔽：点了试寄又关掉面板不保存，内存里的配置
+        # 已经被悄悄改掉，程序之后按这次「没保存」的值寄信 ——
+        # 用户看到的是「我明明没保存，怎么生效了」。盘上的配置没动，
+        # 所以重启又变回去，最容易查错方向。
+        backup = json.loads(json.dumps(nd, ensure_ascii=False))
+        pwd_backup = self.app.secret.get("smtp_password")
+        try:
+            provider = self.var_provider.get()
+            host, port, use_ssl = self._provider_params(provider)
+            nd["provider"] = provider
+            nd["host"] = self.entry_host.get().strip() or host
+            nd["port"] = port
+            nd["use_ssl"] = use_ssl
+            nd["user"] = self.entry_user.get().strip()
+            nd["to"] = self.entry_to.get().strip()
+            # 试寄也要带上抬头，否则用户没法先确认「收件箱里长什么样」
+            nd["signature"] = sign
+            self.app.secret["smtp_password"] = self.entry_pass.get().strip()
+
+            token, err = self.app.send_test_mail()
+        finally:
+            self.app.cfg["notify"] = backup
+            if pwd_backup is None:
+                self.app.secret.pop("smtp_password", None)
+            else:
+                self.app.secret["smtp_password"] = pwd_backup
+
+        if err:
+            self.test_msg.configure(text="✕ " + err, fg=self.pal["seal"])
+            return
+        self.test_msg.configure(text="正在寄出…", fg=self.pal["ink_soft"])
+        self._poll_test(token, 0)
+
+    def _poll_test(self, token, ticks):
+        """等发信进程回话。它在另一个进程里跑，所以界面一直能动。"""
+        path = NOTIFY_TEST_RESULT_PATH
+        if os.path.exists(path):
+            data = _load_json(path, None)
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            if isinstance(data, dict) and data.get("token") == token:
+                if data.get("ok"):
+                    self.test_msg.configure(text="✓ 已寄出，去收件箱看看", fg="#4F7A52")
+                else:
+                    self.test_msg.configure(
+                        text="✕ " + (data.get("error") or "未知错误")[:90],
+                        fg=self.pal["seal"])
+                return
+        if ticks > 60:
+            self.test_msg.configure(text="✕ 等了一分钟没回音，检查网络或授权码",
+                                    fg=self.pal["seal"])
+            return
+        try:
+            self.win.after(500, lambda: self._poll_test(token, ticks + 1))
+        except tk.TclError:
+            pass
+
+    def _build_footer(self):
+        pal = self.pal
+        tk.Frame(self.body, bg=pal["border_soft"], height=1).pack(
+            fill="x", padx=18, pady=(14, 0))
+        bar = tk.Frame(self.body, bg=pal["paper"])
+        bar.pack(fill="x", padx=18, pady=12)
+        self.msg = tk.Label(bar, text="", bg=pal["paper"], fg=pal["seal"],
+                            font=(self.app.fam_cn, 10))
+        self.msg.pack(side="left")
+
+        cancel = tk.Label(bar, text="取 消", bg=pal["paper"], fg=pal["ink_soft"],
+                          font=(self.app.fam_cn, 11), cursor="hand2", padx=16, pady=6)
+        cancel.pack(side="right")
+        cancel.bind("<Button-1>", lambda e: self.close())
+        cancel.bind("<Enter>", lambda e: cancel.configure(fg=pal["seal"]))
+
+        save = tk.Label(bar, text="保 存", bg=pal["seal"], fg="#FFF8EC",
+                        font=(self.app.fam_cn, 11, "bold"), cursor="hand2", padx=22, pady=6)
+        save.pack(side="right", padx=(0, 10))
+        save.bind("<Button-1>", lambda e: self.save())
+        save.bind("<Enter>", lambda e: save.configure(bg=pal["ink"]))
+        save.bind("<Leave>", lambda e: save.configure(bg=pal["seal"]))
+
+    # ---- 颜色规则行 ----
+
+    def _add_row(self, days, color, bg):
+        pal = self.pal
+        row = tk.Frame(self.rules, bg=pal["paper"])
+        row.pack(fill="x", pady=3)
+
+        tk.Label(row, text="剩余 ≤", bg=pal["paper"], fg=pal["ink_soft"],
+                 font=(self.app.fam_cn, 10)).pack(side="left")
+
+        days_var = tk.StringVar(value=("%g" % float(days)) if days is not None else "1")
+        ent = tk.Entry(row, textvariable=days_var, width=5, justify="center",
+                       font=(self.app.fam_num, 11, "bold"),
+                       bg="#FFFBF2", fg=pal["ink"], relief="flat", insertbackground=pal["seal"],
+                       highlightthickness=1, highlightbackground=pal["border_soft"],
+                       highlightcolor=pal["seal"])
+        ent.pack(side="left", padx=5, ipady=3)
+
+        tk.Label(row, text="天", bg=pal["paper"], fg=pal["ink_soft"],
+                 font=(self.app.fam_cn, 10)).pack(side="left")
+
+        tk.Label(row, text="字色", bg=pal["paper"], fg=pal["ink_soft"],
+                 font=(self.app.fam_cn, 10)).pack(side="left", padx=(16, 4))
+
+        record = {"days": days_var, "color": color or "#3A322A",
+                  "bg": bg, "widgets": []}
+
+        fg_btn = self._swatch(row, record, "color")
+        fg_btn.pack(side="left")
+
+        tk.Label(row, text="底色", bg=pal["paper"], fg=pal["ink_soft"],
+                 font=(self.app.fam_cn, 10)).pack(side="left", padx=(12, 4))
+
+        bg_btn = self._swatch(row, record, "bg")
+        bg_btn.pack(side="left")
+
+        rm = tk.Label(row, text="✕", bg=pal["paper"], fg=pal["border_soft"],
+                      font=("Segoe UI", 10), cursor="hand2", padx=8)
+        rm.pack(side="right")
+        rm.bind("<Button-1>", lambda e: self._remove_row(record))
+        rm.bind("<Enter>", lambda e: rm.configure(fg=pal["seal"]))
+        rm.bind("<Leave>", lambda e: rm.configure(fg=pal["border_soft"]))
+
+        record["row"] = row
+        self.rows.append(record)
+
+    def _swatch(self, parent, record, key):
+        """一个可点击的色块按钮；点击弹出预设色板。"""
+        btn = tk.Label(parent, bg=record.get(key) or self.pal["paper"], width=3,
+                       relief="flat", bd=0, cursor="hand2", text=" ",
+                       highlightthickness=1,
+                       highlightbackground=self.pal["border_soft"],
+                       highlightcolor=self.pal["seal"])
+        btn.configure(font=(self.app.fam_cn, 8))
+        if not record.get(key):
+            btn.configure(bg=self.pal["paper"], text="自", fg=self.pal["ink_soft"])
+        btn.bind("<Button-1>", lambda e: self._open_palette(btn, record, key))
+        record["widgets"].append((key, btn))
+        return btn
+
+    def _refresh_swatches(self, record):
+        for key, btn in record["widgets"]:
+            val = record.get(key)
+            if val:
+                btn.configure(bg=val, text=" ")
+            else:
+                btn.configure(bg=self.pal["paper"], text="自")
+
+    def _remove_row(self, record):
+        if record in self.rows:
+            self.rows.remove(record)
+        record["row"].destroy()
+
+    def _dismiss_palette(self, pop):
+        """安全关闭色板弹窗（可能已被销毁，或被 FocusOut 重复触发）。"""
+        try:
+            pop.unbind("<FocusOut>")
+        except tk.TclError:
+            pass
+        try:
+            pop.destroy()
+        except tk.TclError:
+            pass
+        self._color_popup = None
+        self._color_popup_for = None
+
+    def _open_palette(self, anchor, record, key):
+        token = (id(record), key)
+        if self._color_popup is not None:
+            same = (self._color_popup_for == token)
+            self._dismiss_palette(self._color_popup)
+            if same:
+                return                      # 再次点击同一个色块 = 收起
+
+        pop = tk.Toplevel(self.win)
+        pop.overrideredirect(True)
+        pop.attributes("-topmost", True)
+        pop.configure(bg=self.pal["border"])
+        self._color_popup = pop
+        self._color_popup_for = token
+        inner = tk.Frame(pop, bg=self.pal["paper"])
+        inner.pack(padx=2, pady=2)
+
+        tk.Label(inner, text="  选择颜色", bg=self.pal["paper"], fg=self.pal["ink_soft"],
+                 font=(self.app.fam_cn, 9), anchor="w").grid(
+            row=0, column=0, columnspan=6, sticky="we", pady=(3, 4))
+
+        def choose(value):
+            record[key] = value
+            self._refresh_swatches(record)
+            self._dismiss_palette(pop)
+
+        for idx, (name, hexv) in enumerate(PRESET_COLORS):
+            cell = tk.Label(inner, bg=hexv, width=3, height=1, relief="solid", bd=1,
+                            cursor="hand2")
+            cell.grid(row=1 + idx // 6, column=idx % 6, padx=3, pady=2)
+            cell.bind("<Button-1>", lambda e, v=hexv: choose(v))
+            cell.bind("<Enter>", lambda e, c=cell: c.configure(bd=2))
+            cell.bind("<Leave>", lambda e, c=cell: c.configure(bd=1))
+
+        use_bg = tk.Label(inner, text="  使用当前底色（不覆盖）", bg=self.pal["paper"],
+                          fg=self.pal["border"], font=(self.app.fam_cn, 9),
+                          cursor="hand2", anchor="w")
+        use_bg.grid(row=1 + (len(PRESET_COLORS) + 5) // 6, column=0, columnspan=6,
+                    sticky="we", pady=(6, 4))
+        use_bg.bind("<Button-1>", lambda e: choose(None))
+
+        pop.update_idletasks()
+        px = anchor.winfo_rootx()
+        py = anchor.winfo_rooty() + anchor.winfo_height() + 2
+        sw, sh = pop.winfo_screenwidth(), pop.winfo_screenheight()
+        if px + pop.winfo_width() > sw:
+            px = sw - pop.winfo_width() - 8
+        if py + pop.winfo_height() > sh:
+            py = anchor.winfo_rooty() - pop.winfo_height() - 2
+        set_window_pos(pop, px, py)
+        pop.bind("<FocusOut>", lambda e: self._dismiss_palette(pop))
+
+    # ---- 逻辑 ----
+
+    def _preview(self):
+        text = self.entry.get()
+        parsed, err = parse_target(text)
+        if parsed is None:
+            self.preview.configure(text="✕　" + (err or "格式不正确"), fg=self.pal["seal"])
+        else:
+            delta = (parsed - datetime.datetime.now()).total_seconds()
+            self.preview.configure(
+                text="✓　%s　（%s，剩余 %s）" % (
+                    pretty_target(parsed),
+                    parsed.strftime("%Y-%m-%d %H:%M"),
+                    _human_delta(delta)),
+                fg="#4F7A52")
+
+    def _collect(self):
+        out = []
+        for rec in self.rows:
+            raw = rec["days"].get().strip()
+            try:
+                days = float(raw)
+            except ValueError:
+                return None, "「剩余 ≤」一栏需要填写数字"
+            if days < 0:
+                return None, "天数不能为负数"
+            out.append({
+                "days": days,
+                "color": rec.get("color") or "#3A322A",
+                "bg": rec.get("bg"),
+                "label": _auto_label(days),
+            })
+        return out, None
+
+    def save(self):
+        thresholds, err = self._collect()
+        if err:
+            self.msg.configure(text=err)
+            return
+
+        # 地址形状现在就把关。等发信时才失败，用户看到的是一句英文或凭空断连，
+        # 完全联想不到是自己少打了一个点。空着不算错，只是还没填。
+        sender = self.entry_user.get().strip()
+        rcpt = self.entry_to.get().strip()
+        if sender and not looks_like_mail(sender):
+            self.msg.configure(text="发件邮箱「%s」看着不完整，是不是少写了一个点" % sender)
+            return
+        if rcpt and not looks_like_mail(rcpt):
+            self.msg.configure(text="收件邮箱「%s」看着不完整，是不是少写了一个点" % rcpt)
+            return
+
+        # 只在真的启用了提醒时才要求填齐邮箱，否则用户想关掉还得先补资料
+        if self.var_notify.get():
+            if not sender:
+                self.msg.configure(text="启用了邮件提醒，请先填写发件邮箱")
+                return
+            if not self.entry_pass.get().strip():
+                self.msg.configure(text="启用了邮件提醒，请先填写授权码")
+                return
+
+        pair, err = self._collect_notify()
+        if err:
+            self.msg.configure(text=err)
+            return
+        notify_cfg, secret = pair
+
+        err = self.app.apply_settings(self.entry.get(), thresholds,
+                                      self.var_lock.get(), self.var_top.get(),
+                                      notify_cfg, secret)
+        if err:
+            self.msg.configure(text=err)
+            return
+        self.close()
+
+    def close(self):
+        if self._color_popup is not None:
+            self._dismiss_palette(self._color_popup)
+        self.app._settings = None
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+
+    # ---- 杂项 ----
+
+    def _center(self):
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        w = max(self.W, self.win.winfo_reqwidth())
+        h = self.win.winfo_reqheight()
+        # 加了传书区之后面板变得挺高。小屏笔记本放不下时贴着顶部显示，
+        # 至少保证标题栏能够得着 —— 否则用户连关都关不掉。
+        top = max(8, min((sh - h) // 2 - 40, sh - h - 16))
+        set_geometry(self.win, w, h, (sw - w) // 2, top)
+        self._scroll_y = None            # 重新居中后，滚轮的基准要重新取
+
+    def _wheel_scroll(self, event):
+        """
+        面板比屏幕还高时，用滚轮把窗口上下挪，好让底部的「保存」够得着。
+
+        为什么不改成滚动条：面板是可拖拽的无边框窗口，挪窗口是最小改动，
+        而且不动任何既有布局。面板本来放得下时这个函数直接什么都不做。
+
+        位移基准用自己记的 _scroll_y，不去读 winfo_y()：
+        Tk 收到 geometry 请求后，要等窗口真的动了 winfo_y() 才会变；
+        滚轮事件比窗口移动快，读 winfo_y() 会一直拿到旧值，
+        于是每次都从同一个起点重算 —— 表现为「滚轮完全没反应」。
+        """
+        h = self.win.winfo_height()
+        sh = self.win.winfo_screenheight()
+        if h <= sh - 16:
+            return
+
+        # 顶边留 8px、底边留 8px。面板比屏幕高时，后者必然是负数。
+        top, bottom = 8, sh - h - 8
+        cur = self._scroll_y
+        if cur is None:                      # 首次使用，或刚被拖动过
+            cur = self.win.winfo_y()
+
+        try:
+            ticks = int(event.delta) / 120.0
+        except (TypeError, ValueError):
+            ticks = -1.0
+        if ticks == 0:
+            ticks = -1.0
+        # 方向：Windows 上 delta<0 是向下滚，要露出面板下半部分，
+        # 窗口本身得往上挪（y 变小）。
+        y = min(top, max(bottom, cur + int(ticks * 40)))
+        self._scroll_y = y
+        # y 多半是负数，只能走 set_window_pos —— Tk 的 geometry 会把「-292」
+        # 理解成「距屏幕底边 292」，而不是「y 等于 -292」。
+        set_window_pos(self.win, self.win.winfo_x(), y)
+        return "break"
+
+    def _drag_bind(self, widget):
+        widget.bind("<Button-1>", self._drag_start)
+        widget.bind("<B1-Motion>", self._drag_move)
+
+    def _drag_start(self, event):
+        self._pt = (event.x_root - self.win.winfo_x(), event.y_root - self.win.winfo_y())
+        self._scroll_y = None            # 拖动改过位置，滚轮的基准要重新取
+
+    def _drag_move(self, event):
+        if not hasattr(self, "_pt"):
+            return
+        # 拖到左屏 / 上屏时坐标是负的，必须走 set_window_pos，否则窗口会「拖不动」
+        set_window_pos(self.win, event.x_root - self._pt[0],
+                       event.y_root - self._pt[1])
+
+
+def _auto_label(days):
+    if days >= 1:
+        return "剩余 %g 日内" % days
+    hours = days * 24
+    if hours >= 1:
+        return "最后 %g 小时" % round(hours)
+    return "最后 %g 分钟" % round(days * 1440)
+
+
+def _human_delta(seconds):
+    if seconds <= 0:
+        return "已到时刻"
+    d = int(seconds // 86400)
+    h = int(seconds % 86400 // 3600)
+    m = int(seconds % 3600 // 60)
+    s = int(seconds % 60)
+    parts = []
+    if d:
+        parts.append("%d 天" % d)
+    if h or d:
+        parts.append("%d 时" % h)
+    if m or h or d:
+        parts.append("%d 分" % m)
+    parts.append("%d 秒" % s)
+    return "".join(parts)
+
+
+# --------------------------------------------------------------------------
+
+def main():
+    # 打包成 exe 之后，同一个 exe 兼任两个角色：
+    #   双击           -> 正常显示倒计时窗口
+    #   exe mailer ... -> 当发信脚本跑，发完即退（见 run_mailer_cli）
+    # 判据放在取锁之前：发信进程不该被单实例锁挡住。
+    if len(sys.argv) > 1 and sys.argv[1] == "mailer":
+        return run_mailer_cli(sys.argv[1:])
+
+    if not acquire_single_instance():
+        # 已经有实例在跑：不再开新进程（每个进程要占几十 MB），
+        # 而是让已有窗口显出来——用户双击就是想看见它
+        request_wake()
+        return
+    clear_wake_file()
+    app = CountdownApp()
+    app.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
