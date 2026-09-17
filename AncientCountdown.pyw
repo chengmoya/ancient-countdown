@@ -524,13 +524,21 @@ def ensure_mailer():
 def mailer_target():
     """
     交给发信进程的执行目标。
-    正常是 .pyw 脚本路径；打包后若 .pyw 关联到了别的编辑器等程序，就改成自调。
+    正常是 .pyw 脚本路径；打包后就让 exe 自己兼任发信脚本（argv 只给 "mailer"）。
+
+    踩过的坑：打包版曾把 mailer.pyw 的完整路径塞进 argv —— 而主程序 main()
+    的判据是 argv[1] == "mailer"，完整路径对不上号，子进程就走了正常 GUI
+    启动：撞上单实例锁 → 给主实例留「现身」信号 → 主窗口被拉回默认位置。
+    用户看到的是「点一下试寄，倒计时自己挪位了，信也没影」。改成只传
+    "mailer" 后，spawn 形态、main() 判据、run_mailer_cli 的过滤、打包冒烟
+    四处终于说的是同一种话。脚本路径本身不用传：run_mailer_cli 会去
+    _MEIPASS（exe 内嵌副本）找 mailer.pyw，找不到再退回 exe 旁边那份。
     """
     path = ensure_mailer()
     if not path:
         return path, []
     if is_frozen() and os.path.basename(sys.executable).lower().endswith(".exe"):
-        return sys.executable, [path]
+        return sys.executable, ["mailer"]
     return path, []
 
 
