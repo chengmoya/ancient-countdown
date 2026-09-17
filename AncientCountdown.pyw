@@ -33,6 +33,7 @@ import re
 import shutil
 import sys
 import time
+import winreg
 import tkinter as tk
 from tkinter import font as tkfont
 
@@ -53,6 +54,12 @@ MIN_VISIBLE_W, MIN_VISIBLE_H = 140, 70   # 窗口在桌面内的最小露出尺�
 # 让真程序以为「已经有一个在跑了」，其实是它自己把门堵上。
 MUTEX_NAME = "Local\\AncientCountdown_SingleInstance"
 WAKE_FILE = "_wake.signal"       # 第二个实例留下的「请现身」信号
+
+# ---- 开机自动运行 ----
+# 写在 HKCU 的 Run 键里：只影响当前用户，不需要管理员权限，
+# 卸载时也只需删掉这一个值。勾选框的状态永远以注册表为准（见 is_autostart_on）。
+AUTOSTART_RUN_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_VALUE_NAME = "AncientCountdown"
 
 # ---- 飞书传信（邮件通知）----
 # 核心原则：发信一律派生独立进程去做。smtplib 导入要几 MB，
@@ -98,6 +105,7 @@ DEFAULT_CONFIG = {
     "target": "10.1.11.30",
     "locked": False,             # 锁定窗口尺寸
     "always_on_top": True,
+    "autostart": False,          # 开机自动运行（真实状态以注册表为准，此为笔录）
     "window": {"x": None, "y": None, "w": 620, "h": 300},
 
     "palette": {
@@ -638,6 +646,71 @@ def pythonw_executable():
     会闪出一个黑框。这里换成旁边的 pythonw.exe。
     """
     return resolve_python()
+
+
+def autostart_command():
+    """
+    开机时要执行的命令行。
+
+    打包版：exe 自己就能跑，引号包住防路径空格。
+    源码版：用 pythonw.exe 带上脚本全路径 —— 开机没有控制台可闪，
+    必须用无窗解释器，否则每次开机都蹦一个黑框。
+    """
+    if is_frozen():
+        return '"%s"' % sys.executable
+    script = globals().get("__file__") or sys.argv[0]
+    return '"%s" "%s"' % (pythonw_executable(), os.path.abspath(script))
+
+
+def is_autostart_on():
+    """
+    注册表里现在到底挂没挂启动项。
+
+    勾选框的初值以这里的答案为准，而不是配置文件：万一启动项被
+    安全软件或用户手动清掉了，面板上再显示「已勾选」就是在撒谎。
+    """
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_RUN_PATH, 0,
+                            winreg.KEY_READ) as key:
+            winreg.QueryValueEx(key, AUTOSTART_VALUE_NAME)
+        return True
+    except OSError:                     # noqa: B014 - 键或值任一不存在都算「没开」
+        return False
+
+
+def set_autostart(enabled):
+    """
+    开 / 关开机自动运行。
+
+    关：只删我们自己的那一个值，别的程序的自启项一律不碰；
+    值或键本来就不存在也算关成功（幂等，勾了又取消不会报错）。
+    返回 True 表示注册表已同步；极少见的权限失败返回 False，
+    此时勾选框下次打开仍会按注册表实况显示，不会留下假状态。
+    """
+    try:
+        if not enabled:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_RUN_PATH,
+                                    0, winreg.KEY_SET_VALUE) as key:
+                    winreg.DeleteValue(key, AUTOSTART_VALUE_NAME)
+            except FileNotFoundError:
+                pass                    # 本来就没挂，目的已达成
+        else:
+            cmd = autostart_command()
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_RUN_PATH,
+                                    0, winreg.KEY_SET_VALUE) as key:
+                    winreg.SetValueEx(key, AUTOSTART_VALUE_NAME, 0,
+                                      winreg.REG_SZ, cmd)
+            except FileNotFoundError:
+                # Run 键被整个删掉过（个别优化软件干得出来），现建一个
+                with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                                      AUTOSTART_RUN_PATH) as key:
+                    winreg.SetValueEx(key, AUTOSTART_VALUE_NAME, 0,
+                                      winreg.REG_SZ, cmd)
+        return True
+    except OSError:
+        return False
 
 
 def _rule_label(days):
@@ -2132,7 +2205,7 @@ class CountdownApp:
             self._settings.close()
 
     def apply_settings(self, target_text, thresholds, locked, topmost,
-                       notify_cfg=None, secret=None):
+                       autostart=None, notify_cfg=None, secret=None):
         err = None
         parsed, err = parse_target(target_text)
         if parsed is None:
@@ -2142,6 +2215,11 @@ class CountdownApp:
         self.cfg["locked"] = bool(locked)
         self.cfg["always_on_top"] = bool(topmost)
         self.root.attributes("-topmost", bool(topmost))
+        # 开机自启：先同步注册表，再落配置。配置里那份只是笔录，
+        # 面板下次打开仍按注册表实况显示（见 is_autostart_on）。
+        if autostart is not None:
+            self.cfg["autostart"] = bool(autostart)
+            set_autostart(bool(autostart))
         save_config(self.cfg)
 
         # 传书设置：只有「影响寄信判断」的字段真的变了，才作废发送履历。
@@ -2292,8 +2370,11 @@ class SettingsPanel:
         self._section("窗口")
         self.var_lock = tk.BooleanVar(value=bool(app.cfg.get("locked")))
         self.var_top = tk.BooleanVar(value=bool(app.cfg.get("always_on_top", True)))
+        # 自启勾选框的初值读注册表现状而非配置：启动项被清掉时不能显示假状态
+        self.var_autostart = tk.BooleanVar(value=is_autostart_on())
         for var, text in ((self.var_lock, "锁定窗口尺寸（禁止拖拽边缘缩放）"),
-                          (self.var_top, "窗口总在最前")):
+                          (self.var_top, "窗口总在最前"),
+                          (self.var_autostart, "开机自动运行（写入当前用户启动项）")):
             tk.Checkbutton(self.body, text="  " + text, variable=var,
                            bg=pal["paper"], fg=pal["ink"], selectcolor="#FFFBF2",
                            activebackground=pal["paper"], activeforeground=pal["seal"],
@@ -2800,6 +2881,7 @@ class SettingsPanel:
 
         err = self.app.apply_settings(self.entry.get(), thresholds,
                                       self.var_lock.get(), self.var_top.get(),
+                                      self.var_autostart.get(),
                                       notify_cfg, secret)
         if err:
             self.msg.configure(text=err)
