@@ -36,6 +36,7 @@ import time
 import winreg
 import tkinter as tk
 from tkinter import font as tkfont
+from tkinter import messagebox
 
 # --------------------------------------------------------------------------
 # 常量
@@ -481,6 +482,28 @@ def load_config():
 
 def save_config(cfg):
     return reg_store_write("config", cfg)
+
+
+def reset_factory_data():
+    """
+    恢复出厂设置的「数据部分」：整个删掉数据键，再按空仓重新读出三份默认数据。
+
+    为什么要单独拆出一个不带界面的函数：
+      · 只删注册表是假干净 —— 内存里还抱着旧配置，下一次 tick 记窗口位置、
+        或者退出时落盘，都会把旧配置原样写回去，删掉的键转眼复活，用户点了白点。
+        所以删完必须立刻重新加载，让内存也回到初始值。
+      · 分开之后，自检脚本可以只测数据这一段（不用开窗口就能断言），
+        界面刷新那部分留给 CountdownApp.factory_reset 单独负责。
+
+    删完刻意不回写：空仓才是「从没配置过」的真实状态，
+    配置会在用户下一次真的改动时自然落盘（那时写的已经是默认值了）。
+
+    返回 (cfg, secret, notify_state) 三份全新的默认数据。
+    notify.signature 由 load_config 按「首次运行」的规则补种本机名，
+    和刚装好时一模一样。
+    """
+    reg_store_drop_all(reg_store_key())
+    return load_config(), load_notify_secret(), load_notify_state()
 
 
 # --------------------------------------------------------------------------
@@ -1244,7 +1267,14 @@ class CountdownApp:
         ny = min(max(y, vt), max(vt, vb - h))
         return int(nx), int(ny), True
 
-    def _place_window(self):
+    def _place_window(self, persist=True):
+        """
+        按存档（或缺省）把窗口摆到该在的位置。
+
+        persist=False 只挪窗口、不落盘 —— 恢复出厂时用它：
+        键刚被整个删掉，立刻又写一份默认配置回去，用户开注册表一看
+        「怎么还在」，会以为没生效。让它空着，等用户真改了什么再自然落盘。
+        """
         win = self.cfg.get("window", {})
         vl, vt, vr, vb = screen_rect(self.root)
         # 尺寸同样要校验：换到更小的屏幕后，旧的大尺寸也会把窗口撑出可视区
@@ -1266,7 +1296,8 @@ class CountdownApp:
         self.x, self.y = int(x), int(y)
         self.cfg.setdefault("window", {})
         self.cfg["window"].update({"x": self.x, "y": self.y})
-        save_config(self.cfg)
+        if persist:
+            save_config(self.cfg)
         set_geometry(self.root, self.w, self.h, self.x, self.y)
 
     def _bind_events(self):
@@ -2321,6 +2352,55 @@ class CountdownApp:
         self.layout()
         return None
 
+    def factory_reset(self):
+        """
+        恢复出厂设置：清掉注册表里的数据键，并把内存、窗口、界面一起打回「刚装好」。
+
+        清理范围（都在同一个数据键里，一个键装了全部）：
+          目标时刻 / 颜色规则 / 配色 / 邮箱与授权码 / 寄信履历 / 窗口位置与大小。
+        不动开机自启 —— 它写在另一个地方（HKCU\\...\\Run，见 set_autostart），
+        属于「系统里装了什么」，不是「这个程序里存了什么」；
+        而且用户多半正是靠自启才看得见这个按钮，顺手清掉反而添乱。
+
+        界面为什么必须当场刷新：只清数据不刷新，屏幕上还是旧时刻旧配色，
+        用户会以为没生效，甚至再点一次。这里让窗口回到默认位置与默认大小、
+        配色换回宣纸、倒计时按默认时刻重算 —— 全程不需要重启程序。
+
+        返回 None 表示成功；返回字符串表示失败原因，交给界面提示。
+        """
+        try:
+            self.cfg, self.secret, self.notify_state = reset_factory_data()
+        except Exception as exc:                      # noqa: BLE001
+            # 删键/重读几乎不会失败（都做了兜底），真失败也不能让程序崩在这儿
+            return "恢复出厂失败：%s" % exc
+
+        # --- 内存状态重新对齐：不清这些，下一帧就会拿旧值算 ---
+        self.target, self.parse_err = parse_target(self.cfg.get("target"))
+        self.remaining = None
+        self.zero_mode = False
+        self._last_text = None
+        self.theme = None
+        self.blink = False
+        self._last_notify_check = 0.0        # 让下一轮巡检立刻用新设置重算
+        self._notify_note = ""
+        self._notify_note_at = 0.0
+
+        # --- 界面：配色、置顶、窗口位置尺寸、整幅重绘 ---
+        pal = self.cfg["palette"]
+        self.root.configure(bg=pal["ink"])
+        self.canvas.configure(bg=pal["paper"])
+        self.root.attributes("-topmost", bool(self.cfg.get("always_on_top", True)))
+        # 位置与尺寸交回 _place_window（它读的已经是刚重置过的 cfg["window"]，
+        # x/y 为 None 时自然落回默认点）；persist=False —— 见那里的说明
+        self._place_window(persist=False)
+        self.W, self.H = self.w, self.h
+        self.root.deiconify()
+        self.root.lift()
+
+        self._refresh_menu()
+        self.layout()
+        return None
+
     def run(self):
         self.root.mainloop()
 
@@ -2727,6 +2807,16 @@ class SettingsPanel:
                             font=(self.app.fam_cn, 10))
         self.msg.pack(side="left")
 
+        # 恢复出厂：和「取 消」同一套做法（tk.Label + bind），不引入新样式，
+        # 也不加 ttk —— 面板里所有按钮都是自绘的，混进来会显得格格不入。
+        # 放左边而不是挨着「保 存」：它是个危险动作，不该出现在手指习惯落点上。
+        reset = tk.Label(bar, text="恢复出厂", bg=pal["paper"], fg=pal["ink_soft"],
+                         font=(self.app.fam_cn, 11), cursor="hand2", padx=12, pady=6)
+        reset.pack(side="left", padx=(6, 0))
+        reset.bind("<Button-1>", lambda e: self._factory_reset())
+        reset.bind("<Enter>", lambda e: reset.configure(fg=pal["seal"]))
+        reset.bind("<Leave>", lambda e: reset.configure(fg=pal["ink_soft"]))
+
         cancel = tk.Label(bar, text="取 消", bg=pal["paper"], fg=pal["ink_soft"],
                           font=(self.app.fam_cn, 11), cursor="hand2", padx=16, pady=6)
         cancel.pack(side="right")
@@ -2952,6 +3042,44 @@ class SettingsPanel:
             self.msg.configure(text=err)
             return
         self.close()
+
+    def _factory_reset(self):
+        """
+        点「恢复出厂」：先把后果用人话讲清楚，确认后才动手。
+
+        必须二次确认 —— 这一步会把授权码一起清掉，而授权码是用户去邮箱后台
+        单独申请来的（不是登录密码），丢了他得重新走一遍申请流程。
+        所以提示里要把「会失去什么」逐条列出来，不能只写一句「确定吗」。
+
+        确认后不做任何「自己写默认值回去」的动作：数据键删掉就是删掉，
+        界面由 app.factory_reset 当场重画，用户不需要重启程序。
+        """
+        ok = messagebox.askyesno(
+            "恢复出厂设置",
+            "将清空本程序保存的全部数据，恢复成刚安装时的样子：\n\n"
+            "　· 目标时刻\n"
+            "　· 颜色规则与配色\n"
+            "　· 邮箱地址与授权码\n"
+            "　· 寄信履历\n"
+            "　· 窗口位置与大小\n\n"
+            "清空后无法撤销（授权码需要重新去邮箱申请）。\n"
+            "开机自动运行的设置会保留，不受影响。\n\n"
+            "是否继续？",
+            parent=self.win)
+        if not ok:
+            return
+
+        err = self.app.factory_reset()
+        if err:
+            self.msg.configure(text=err)
+            return
+        self.close()
+        messagebox.showinfo(
+            "恢复出厂设置",
+            "已恢复出厂设置。\n\n"
+            "目标时刻已改回示例值，重新点「設」即可设置自己的日子。\n"
+            "（要送人或卸载：再取消勾选「开机自动运行」，退出程序后删掉 exe 就行。）",
+            parent=self.app.root)
 
     def close(self):
         if self._color_popup is not None:
