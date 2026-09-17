@@ -277,26 +277,15 @@ def acquire_single_instance():
         return True
 
 
-def wake_file_path():
-    return os.path.join(DATA_DIR, WAKE_FILE)
-
-
 def request_wake():
     """请已有实例把窗口挪到可见处——用户双击，本意就是「我要看见它」。"""
-    try:
-        with open(wake_file_path(), "w", encoding="utf-8") as fh:
-            fh.write(str(os.getpid()))
-        return True
-    except OSError:
-        return False
+    ok, _ = reg_store_write("wake", {"pid": os.getpid()})
+    return ok
 
 
 def clear_wake_file():
-    """清掉可能残留的信号文件，避免刚启动就自己触发一次「现身」。"""
-    try:
-        os.remove(wake_file_path())
-    except OSError:
-        pass
+    """清掉可能残留的唤醒信号，避免刚启动就自己触发一次「现身」。"""
+    reg_store_delete("wake")
 
 
 def script_home():
@@ -351,6 +340,110 @@ NOTIFY_SECRET_PATH = os.path.join(DATA_DIR, NOTIFY_SECRET_FILE)
 MAILER_PATH = os.path.join(app_dir(), MAILER_FILE)
 
 
+# --------------------------------------------------------------------------
+# 数据仓 · 注册表
+#
+# 配置、凭据、履历全部存进注册表（HKCU\Software\AncientCountdown），
+# 程序目录里不再出现任何数据文件 —— 文件夹里永远只有程序本身。
+#
+# 为什么不是「把配置写进 exe 里」：exe 运行时是只读的，程序不能修改自己，
+# 而这些数据恰恰是随时要写的（窗口位置、目标时刻、寄信履历）。
+# 注册表是 Windows 给「程序要写、又不该满地留文件」准备的正经地方，
+# 微信/QQ 的本地设置也存在这里。
+#
+# 演练隔离：设了 ANCIENT_COUNTDOWN_HOME 时，读写改道到 Software\AncientCountdown_Test，
+# 真实数据分毫不动 —— 和旧版「改道到临时目录」一个思路，只是阵地从文件换成了注册表。
+# --------------------------------------------------------------------------
+
+REG_STORE_ROOT = r"Software\AncientCountdown"
+
+
+def reg_store_key():
+    """当前进程该用哪个注册表键。演练时带 _Test 后缀，绝不碰真实数据。"""
+    if os.environ.get("ANCIENT_COUNTDOWN_HOME"):
+        return REG_STORE_ROOT + "_Test"
+    return REG_STORE_ROOT
+
+
+def reg_store_read(name, fallback):
+    """读一个 JSON 值。键不存在或内容损坏时返回 fallback 的深拷贝。"""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_store_key(), 0,
+                            winreg.KEY_READ) as key:
+            raw, _ = winreg.QueryValueEx(key, name)
+        data = json.loads(raw)
+    except (OSError, ValueError):
+        return json.loads(json.dumps(fallback))
+    if data is None:
+        return json.loads(json.dumps(fallback))
+    return data
+
+
+def reg_store_write(name, data):
+    """写一个 JSON 值。注册表单值上限约 1MB，本程序所有数据远小于此。"""
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, reg_store_key()) as key:
+            winreg.SetValueEx(key, name, 0, winreg.REG_SZ,
+                              json.dumps(data, ensure_ascii=False))
+        return True, ""
+    except OSError as exc:
+        return False, str(exc)
+
+
+def reg_store_delete(name):
+    """删一个值。不存在也当删成功（幂等）。"""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_store_key(), 0,
+                            winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, name)
+    except OSError:
+        pass
+
+
+def reg_store_drop_all(key_path):
+    """整个删掉一个数据键（恢复出厂与演练收尾用）。本程序的键没有子键。"""
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, key_path)
+    except OSError:
+        pass
+
+
+def migrate_legacy_files():
+    """
+    老版本把配置/凭据/履历放在程序旁边的文件里；升级后搬进注册表。
+
+    只在真实模式跑一次（演练目录里不会有旧文件）。搬完把旧文件删干净 ——
+    包括可能残留的瞬态文件（任务/结果/唤醒信号，任务里含授权码，绝不过夜）。
+    任何一步失败都保留原文件，下次启动再试；数据以文件为准（只有旧版本写过它）。
+    """
+    if os.environ.get("ANCIENT_COUNTDOWN_HOME"):
+        return
+    pairs = [(CONFIG_PATH, "config"),
+             (NOTIFY_SECRET_PATH, "notify_secret"),
+             (NOTIFY_STATE_PATH, "notify_state")]
+    for path, name in pairs:
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+        except Exception:                         # noqa: BLE001
+            continue                              # 文件不存在或损坏 —— 没有可搬的
+        ok, _ = reg_store_write(name, data)
+        if not ok:
+            continue                              # 写注册表失败：保留文件下次再试
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    # 瞬态残留：任务（含授权码）/结果/唤醒信号，连同可能的 .tmp 半截文件
+    for junk in (NOTIFY_TASK_PATH, NOTIFY_RESULT_PATH, NOTIFY_TEST_RESULT_PATH,
+                 os.path.join(DATA_DIR, WAKE_FILE)):
+        for p in (junk, junk + ".tmp"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
 def deep_merge(base, override):
     """把 override 合并进 base 的副本（保留 base 中缺失的默认键）。"""
     out = dict(base)
@@ -364,23 +457,22 @@ def deep_merge(base, override):
 
 def load_config():
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as fp:
-            raw = json.load(fp)
+        raw = reg_store_read("config", {})
         if not isinstance(raw, dict):
             raw = {}
     except Exception:
         # 首次运行读不到、或配置损坏 —— 都当空配置处理，不阻塞启动
         raw = {}
 
-    # 先深拷贝默认值：deep_merge 只做浅拷贝，盘上缺哪个键，
+    # 先深拷贝默认值：deep_merge 只做浅拷贝，仓里缺哪个键，
     # 合并结果里那一层就和模块级 DEFAULT_CONFIG 共用同一个 dict，
     # 后面任何就地改动（比如给 notify 补种抬头）都会把默认值本身弄脏。
     base = json.loads(json.dumps(DEFAULT_CONFIG))
     cfg = deep_merge(base, raw)
 
-    # 一次性补种本机抬头：盘上的配置里没有这个键时，用计算机名种进去，
+    # 一次性补种本机抬头：仓里没有这个键时，用计算机名种进去，
     # 这样多台机器装上去开箱就能分辨，用户想改成「书房台机」再改。
-    # 判据必须是「盘上原始配置有没有这个键」，不能看合并后的值 ——
+    # 判据必须是「原始配置有没有这个键」，不能看合并后的值 ——
     # 合并会把默认值补上，就分不清「从没设过」和「用户特意清空了」。
     if "signature" not in (raw.get("notify") or {}):
         cfg["notify"] = dict(cfg.get("notify") or {}, signature=machine_name())
@@ -388,51 +480,25 @@ def load_config():
 
 
 def save_config(cfg):
-    try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as fp:
-            json.dump(cfg, fp, ensure_ascii=False, indent=2)
-        return True, ""
-    except Exception as exc:                      # noqa: BLE001
-        return False, str(exc)
+    return reg_store_write("config", cfg)
 
 
 # --------------------------------------------------------------------------
 # 鸿雁传书 · 状态与凭据
 #
-# 三份文件各司其职，互不干扰：
-#   countdown_config.json  你的设置（可随意分享）
-#   notify_secret.json     邮箱授权码（含密码，别外传）
-#   notify_state.json      发送履历（程序自己维护，你不需要看）
-# 拆开的好处是：频繁写履历不会碰到设置文件，也就不会把设置写坏。
+# 三份数据各司其职，互不干扰（都在注册表键里，值名区分）：
+#   config          你的设置（可随意分享）
+#   notify_secret   邮箱授权码（含密码，别外传）
+#   notify_state    发送履历（程序自己维护，你不需要看）
+# 拆开的好处是：频繁写履历不会碰到设置数据，也就不会把设置写坏。
 # --------------------------------------------------------------------------
 
 def _stamp(fmt="%Y-%m-%d %H:%M:%S"):
     return datetime.datetime.now().strftime(fmt)
 
 
-def _load_json(path, fallback):
-    try:
-        with open(path, "r", encoding="utf-8") as fp:
-            data = json.load(fp)
-        return data if data is not None else json.loads(json.dumps(fallback))
-    except Exception:                             # noqa: BLE001
-        return json.loads(json.dumps(fallback))
-
-
-def _save_json(path, data):
-    """原子写入：先写临时文件再替换，中途出错也不会留下半截文件。"""
-    tmp = path + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as fp:
-            json.dump(data, fp, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-        return True, ""
-    except Exception as exc:                      # noqa: BLE001
-        return False, str(exc)
-
-
 def load_notify_state():
-    st = _load_json(NOTIFY_STATE_PATH, {"target_key": "", "history": []})
+    st = reg_store_read("notify_state", {"target_key": "", "history": []})
     if not isinstance(st, dict):
         st = {"target_key": "", "history": []}
     st.setdefault("target_key", "")
@@ -442,11 +508,11 @@ def load_notify_state():
 
 
 def save_notify_state(st):
-    return _save_json(NOTIFY_STATE_PATH, st)
+    return reg_store_write("notify_state", st)
 
 
 def load_notify_secret():
-    sec = _load_json(NOTIFY_SECRET_PATH, {"smtp_password": ""})
+    sec = reg_store_read("notify_secret", {"smtp_password": ""})
     if not isinstance(sec, dict):
         sec = {"smtp_password": ""}
     sec.setdefault("smtp_password", "")
@@ -454,7 +520,7 @@ def load_notify_secret():
 
 
 def save_notify_secret(sec):
-    return _save_json(NOTIFY_SECRET_PATH, sec)
+    return reg_store_write("notify_secret", sec)
 
 
 def is_frozen():
@@ -1562,8 +1628,8 @@ class CountdownApp:
         """
         now = datetime.datetime.now()
 
-        # 顺带看一眼有没有第二个实例在喊「现身」（一次文件 stat，开销可忽略）
-        if os.path.exists(wake_file_path()):
+        # 顺带看一眼有没有第二个实例在喊「现身」（一次注册表读，开销可忽略）
+        if reg_store_read("wake", None) is not None:
             self._consume_wake()
 
         # 传书巡检。每 30 秒才真跑一次 —— 中间那些秒只是一次减法比较，
@@ -1942,14 +2008,15 @@ class CountdownApp:
         task = build_notify_task(nd, self.secret, token, subject, body,
                                  self.notify_recipient(), self.notify_signature())
 
-        ok, err = _save_json(NOTIFY_TASK_PATH, task)
+        ok, err = reg_store_write("notify_task", task)
         if not ok:
-            return False, "任务文件写不进去：%s" % err
+            return False, "任务写不进注册表：%s" % err
 
         # 两条启动路径，见 mailer_target()：平时用解释器跑 .pyw；
         # 打包后若 .pyw 没有好的关联程序，就让 exe 自己兼任发信脚本。
         target, prefix = mailer_target()
         if not target:
+            reg_store_delete("notify_task")       # 任务里含授权码，别留在注册表
             return False, "找不到发信脚本 %s" % MAILER_FILE
         argv = [target] + prefix
         if not prefix:
@@ -1958,14 +2025,14 @@ class CountdownApp:
             argv.append("test")
         flags = 0x08000000 if os.name == "nt" else 0      # CREATE_NO_WINDOW
 
-        # 用环境变量把「数据目录在哪」明确告诉发信进程。
+        # 用环境变量把「数据仓在哪」明确告诉发信进程。
         #
-        # 不能指望它自己找到：打包后 exe 会把 mailer.pyw 解到临时目录跑，
-        # 脚本按「自己所在目录」去找任务文件就会落空 —— 现象是信发出去了、
-        # 但结果永远收不回来。演练（隔离目录）时更是必须传，
-        # 否则发信进程会去读真实配置里的路径。
+        # 不能指望它自己猜：注册表键名带演练后缀（ ANCIENT_COUNTDOWN_HOME
+        # 触发的隔离通道），发信进程必须读写同一个键才能交回结果。
+        # HOME 继续传：发信崩溃日志、迁移逻辑还认它。
         env = dict(os.environ)
         env["ANCIENT_COUNTDOWN_HOME"] = DATA_DIR
+        env["ANCIENT_COUNTDOWN_REGKEY"] = reg_store_key()
         try:
             subprocess.Popen(
                 argv,
@@ -1978,10 +2045,7 @@ class CountdownApp:
                 env=env,
             )
         except Exception as exc:                          # noqa: BLE001
-            try:
-                os.remove(NOTIFY_TASK_PATH)               # 里面含授权码，别留在盘上
-            except OSError:
-                pass
+            reg_store_delete("notify_task")               # 里面含授权码，别留在注册表
             return False, "发信进程起不来：%s" % exc
         return True, ""
 
@@ -2010,14 +2074,11 @@ class CountdownApp:
         return True
 
     def collect_notify_result(self):
-        """取回发信进程留下的结果。没有结果文件时只花一次文件判断。"""
-        if not os.path.exists(NOTIFY_RESULT_PATH):
+        """取回发信进程留下的结果。没有结果时只花一次注册表读。"""
+        data = reg_store_read("notify_result", None)
+        if data is None:
             return
-        data = _load_json(NOTIFY_RESULT_PATH, None)
-        try:
-            os.remove(NOTIFY_RESULT_PATH)
-        except OSError:
-            pass
+        reg_store_delete("notify_result")
         if not isinstance(data, dict):
             return
 
@@ -2636,13 +2697,9 @@ class SettingsPanel:
 
     def _poll_test(self, token, ticks):
         """等发信进程回话。它在另一个进程里跑，所以界面一直能动。"""
-        path = NOTIFY_TEST_RESULT_PATH
-        if os.path.exists(path):
-            data = _load_json(path, None)
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+        data = reg_store_read("notify_test_result", None)
+        if data is not None:
+            reg_store_delete("notify_test_result")
             if isinstance(data, dict) and data.get("token") == token:
                 if data.get("ok"):
                     self.test_msg.configure(text="✓ 已寄出，去收件箱看看", fg="#4F7A52")
@@ -3015,6 +3072,7 @@ def main():
         request_wake()
         return
     clear_wake_file()
+    migrate_legacy_files()   # 老版本的配置/凭据/履历文件搬进注册表（一次性）
     app = CountdownApp()
     app.run()
 

@@ -13,10 +13,10 @@
 
 怎么被调用（由 AncientCountdown.pyw 自动完成，不需要手动运行）
   pythonw mailer.pyw
-  读取同目录的 notify_task.json，寄出后写 notify_result.json。
+  从注册表读任务（notify_task），寄出后把结果写回注册表（notify_result）。
 
 退出码
-  0 = 寄出成功    1 = 寄出失败    2 = 任务文件缺失或损坏
+  0 = 寄出成功    1 = 寄出失败    2 = 任务缺失或损坏
 """
 
 import json
@@ -24,43 +24,65 @@ import os
 import smtplib
 import ssl
 import sys
+import winreg
 from email.message import EmailMessage
 from email.utils import formataddr
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-# 跟随主程序的数据目录设定：正常使用与脚本同目录，
-# 只有演练时（设了 ANCIENT_COUNTDOWN_HOME）才读写临时目录
-BASE = os.environ.get("ANCIENT_COUNTDOWN_HOME") or HERE
-TASK_PATH = os.path.join(BASE, "notify_task.json")
-RESULT_PATH = os.path.join(BASE, "notify_result.json")
-TEST_RESULT_PATH = os.path.join(BASE, "notify_test_result.json")
+# 数据仓在注册表里。键名由主程序通过环境变量指定（带演练隔离后缀），
+# 拿不到 env 就用默认键 —— 源码模式手工调用时读写的正是真实数据。
+REGKEY = os.environ.get("ANCIENT_COUNTDOWN_REGKEY") or r"Software\AncientCountdown"
+TASK_NAME = "notify_task"
+RESULT_NAME = "notify_result"
+TEST_RESULT_NAME = "notify_test_result"
 TIMEOUT = 25.0          # 单次网络操作上限，避免进程僵在那里
 ERR_LIMIT = 300
 
 
-def write_result(path, token, ok, error=""):
-    """把结果落盘。主程序下一轮巡检会来取走。"""
-    payload = {"token": token, "ok": bool(ok), "error": (error or "")[:ERR_LIMIT]}
-    tmp = path + ".tmp"
+def _reg_value(name):
     try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False)
-        os.replace(tmp, path)        # 原子替换，主程序不会读到半截文件
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REGKEY, 0,
+                            winreg.KEY_READ) as key:
+            raw, _ = winreg.QueryValueEx(key, name)
+        return json.loads(raw)
+    except (OSError, ValueError):
+        return None
+
+
+def _set_reg_value(name, data):
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, REGKEY) as key:
+            winreg.SetValueEx(key, name, 0, winreg.REG_SZ,
+                              json.dumps(data, ensure_ascii=False))
+        return True
+    except OSError:
+        return False
+
+
+def _del_reg_value(name):
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REGKEY, 0,
+                            winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, name)
     except OSError:
         pass
+
+
+def write_result(name, token, ok, error=""):
+    """把结果写回注册表。主程序下一轮巡检会来取走。"""
+    payload = {"token": token, "ok": bool(ok), "error": (error or "")[:ERR_LIMIT]}
+    _set_reg_value(name, payload)
 
 
 def read_task():
-    with open(TASK_PATH, "r", encoding="utf-8") as fh:
-        return json.load(fh)
+    task = _reg_value(TASK_NAME)
+    if not isinstance(task, dict):
+        raise ValueError("task missing or damaged")
+    return task
 
 
 def drop_task():
-    """任务文件里带着授权码，无论成败都要立刻抹掉。"""
-    try:
-        os.remove(TASK_PATH)
-    except OSError:
-        pass
+    """任务里带着授权码，无论成败都要立刻抹掉。"""
+    _del_reg_value(TASK_NAME)
 
 
 def build_message(task, user):
@@ -166,18 +188,18 @@ def main():
 
     token = task.get("token", "")
     smtp = task.get("smtp") or {}
-    # 试寄模式把结果写到另一个文件：正式通知的履历不该被一次试验污染，
-    # 两者也可能同时存在，共用文件会互相抢
+    # 试寄模式把结果写到另一个值：正式通知的履历不该被一次试验污染，
+    # 两者也可能同时存在，共用一个值会互相抢
     test_mode = len(sys.argv) > 1 and sys.argv[1] == "test"
-    result_path = TEST_RESULT_PATH if test_mode else RESULT_PATH
+    result_name = TEST_RESULT_NAME if test_mode else RESULT_NAME
 
     if not smtp.get("user") or not smtp.get("password"):
-        write_result(result_path, token, False, "发件邮箱或授权码为空，还没配置完整。")
+        write_result(result_name, token, False, "发件邮箱或授权码为空，还没配置完整。")
         drop_task()
         return 1
 
     if not task.get("to"):
-        write_result(result_path, token, False, "收件地址为空。")
+        write_result(result_name, token, False, "收件地址为空。")
         drop_task()
         return 1
 
@@ -185,13 +207,13 @@ def main():
     # 甚至直接掐断连接，使用者根本看不出是自己少写了一个点。
     sender = (smtp.get("user") or "").strip()
     if not looks_like_mail(sender):
-        write_result(result_path, token, False,
+        write_result(result_name, token, False,
                      "发件邮箱地址看着不完整：%s —— 检查是不是少写了一个点。" % sender)
         drop_task()
         return 1
     rcpt = (task.get("to") or "").strip()
     if not looks_like_mail(rcpt):
-        write_result(result_path, token, False,
+        write_result(result_name, token, False,
                      "收件邮箱地址看着不完整：%s —— 检查是不是少写了一个点。" % rcpt)
         drop_task()
         return 1
@@ -199,11 +221,11 @@ def main():
     try:
         deliver(task)
     except Exception as exc:                     # noqa: BLE001
-        write_result(result_path, token, False, friendly(exc))
+        write_result(result_name, token, False, friendly(exc))
         drop_task()
         return 1
 
-    write_result(result_path, token, True, "")
+    write_result(result_name, token, True, "")
     drop_task()
     return 0
 
