@@ -1292,7 +1292,15 @@ def install_update(new_exe_path):
         return False, "更新失败，程序保持原样：%s" % e
 
     try:
-        subprocess.Popen([target, AFTER_UPDATE_ARG], cwd=workdir)
+        # 关键：清掉 PyInstaller onefile 的内部环境变量（_PYI_*）。
+        # 新版 bootloader 会凭这些变量校验「发起方父进程」，而本进程
+        # 是即将退出的旧实例、镜像刚被改名 —— 校验对不上，
+        # 新进程会弹「Security validation failure」然后拒绝启动。
+        # 给新进程一份干净环境，它就当自己是被用户正常双击启动的。
+        env = dict(os.environ)
+        for key in [k for k in env if k.startswith("_PYI")]:
+            env.pop(key)
+        subprocess.Popen([target, AFTER_UPDATE_ARG], cwd=workdir, env=env)
     except Exception as e:
         # 程序已经换成新的了，只是没自动起来 —— 告诉用户手动双击即可
         return False, "新版本已就位，但没能自动启动：%s\n请手动双击 %s" % (e, target)
@@ -3801,7 +3809,42 @@ def _human_delta(seconds):
 
 # --------------------------------------------------------------------------
 
+CRASH_LOG_FILE = "ac_crash.log"
+
+
+def install_crash_hook():
+    """
+    打包成 windowed exe 后没有控制台，未捕获异常只能弹一个 PyInstaller
+    的 Error 框， traceback 随风而去 —— 用户看到框，我们什么都看不到。
+    装上这个钩子后，异常照常弹框，但在此之前会先写一份完整 traceback
+    到 %TEMP%\\ac_crash.log（追加模式），事后能查、能贴、能诊断。
+    """
+    import tempfile
+    import traceback
+
+    prev = sys.excepthook
+
+    def hook(tp, val, tb):
+        try:
+            with open(os.path.join(tempfile.gettempdir(), CRASH_LOG_FILE),
+                      "a", encoding="utf-8") as f:
+                f.write("=== %s ===\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+                traceback.print_exception(tp, val, tb, file=f)
+                f.write("\n")
+        except Exception:
+            pass
+        if prev:
+            try:
+                prev(tp, val, tb)
+            except Exception:
+                pass
+
+    sys.excepthook = hook
+
+
 def main():
+    install_crash_hook()   # 越早越好：之后任何未捕获异常都会留诊断文件
+
     # 打包成 exe 之后，同一个 exe 兼任两个角色：
     #   双击           -> 正常显示倒计时窗口
     #   exe mailer ... -> 当发信脚本跑，发完即退（见 run_mailer_cli）
