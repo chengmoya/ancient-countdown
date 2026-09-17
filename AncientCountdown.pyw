@@ -45,6 +45,12 @@ from tkinter import messagebox
 APP_NAME = "古风倒计时"
 APP_SUB = "ANCIENT COUNTDOWN"
 
+# 当前版本号，与 version.json 里的 version、Release 的 tag 三者对应。
+# 在线升级靠它判断「有没有新版」：两边都是 "主.次" 两段数字，
+# 比较时拆成 (1, 3) 这样的小元组比大小 —— 字符串比会出事，
+# "1.10" < "1.9" 在字符串世界里是成立的，那会让用户升不上去。
+APP_VERSION = "1.4"
+
 MIN_W, MIN_H = 300, 150          # 窗口最小尺寸
 RESIZE_MARGIN = 9                # 边缘拖拽感应带宽度(px)
 TICK_IDLE_MS = 600               # 归零状态闪烁间隔
@@ -78,6 +84,26 @@ NOTIFY_RESULT_FILE = "notify_result.json"
 NOTIFY_TEST_RESULT_FILE = "notify_test_result.json"
 NOTIFY_STATE_FILE = "notify_state.json"
 NOTIFY_SECRET_FILE = "notify_secret.json"
+
+# ---- 在线升级 ----
+#
+# 版本信息是一份小 JSON（约 600 字节），放在 CNB 上一个 tag 固定为
+# update-info 的 Release 附件里。为什么绕这一下：
+#   · CNB 的 API、以及仓库文件的直读，**都必须登录**（匿名一律 401）；
+#     只有 Release 的附件是免登录可下的（实测 200）。
+#   · 于是把「版本号 + 下载地址 + sha256」做成一个附件，程序直接下载它，
+#     查询和下载就都走国内，不碰 GitHub。
+#   · tag 固定，所以 URL 永远不变；每次发版只覆盖附件内容。
+# 备用通道走 GitHub 的 Release API（匿名可读），万一 CNB 不可达还能查。
+UPDATE_INFO_CNB = ("https://cnb.cool/chengmoCNB/ancient-countdown"
+                   "/-/releases/download/update-info/version.json")
+UPDATE_INFO_GITHUB_API = ("https://api.github.com/repos/chengmoya"
+                          "/ancient-countdown/releases/latest")
+UPDATE_FALLBACK_CNB = ("https://cnb.cool/chengmoCNB/ancient-countdown"
+                       "/-/releases/download/%s/AncientCountdown_%s.zip")
+UPDATE_CONNECT_TIMEOUT = 12      # 连不上就别让用户干等
+UPDATE_MAX_INFO_BYTES = 200000   # 版本信息不可能超过这个数，防异常响应
+UPDATE_OLD_SUFFIX = ".old"       # 旧 exe 被改名后的后缀（保留以便回滚）
 
 # 常见邮箱的 SMTP 参数：(显示名, 服务器, 端口, 是否 SSL)
 # 选服务商只填邮箱地址和授权码即可，服务器参数自动带出
@@ -965,6 +991,414 @@ def pretty_target(dt):
     if dt.second:
         hm += ":%02d" % dt.second
     return "%s %s" % (head, hm)
+
+
+# --------------------------------------------------------------------------
+# 在线升级
+# --------------------------------------------------------------------------
+#
+# 这一节的所有 import 都写在函数内部（延迟导入）。
+# 理由是本程序的立身之本就是「空闲 CPU ≈ 0、冷启动 < 0.5 秒」：
+# urllib 这套东西一导入就要几毫秒外加常驻内存，而绝大多数用户
+# **永远不会点**「检查更新」。没必要让所有人替少数人付这份开销。
+
+def version_tuple(text):
+    """把 "1.10" 拆成 (1, 10)。比较两个版本用元组，别用字符串。"""
+    parts = []
+    for chunk in str(text or "").split("."):
+        m = re.match(r"\d+", chunk.strip())
+        parts.append(int(m.group()) if m else 0)
+    while len(parts) < 2:
+        parts.append(0)
+    return tuple(parts[:4])
+
+
+def update_available(remote_version):
+    """远端版本比本地新，才叫「有更新」。降级或持平均返回 False。"""
+    try:
+        return version_tuple(remote_version) > version_tuple(APP_VERSION)
+    except (TypeError, ValueError):
+        return False
+
+
+def _http_get(url, timeout=UPDATE_CONNECT_TIMEOUT, max_bytes=None,
+              headers=None, progress=None):
+    """
+    取一个 URL 的内容。返回 (bytes, None) 或 (None, 错误文案)。
+
+    progress(已读字节, 总字节) 会被周期性回调，用来在界面上显示进度；
+    总字节拿不到时传 -1（服务器没给 Content-Length）。
+    """
+    import urllib.request
+    import urllib.error
+
+    req = urllib.request.Request(url)
+    # 注意：HTTP 头按 latin-1 编码，塞中文（APP_NAME）会直接 UnicodeEncodeError，
+    # 所以 UA 必须用纯 ASCII 的英文项目名。
+    req.add_header("User-Agent", "AncientCountdown/%s" % APP_VERSION)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            total = -1
+            try:
+                total = int(resp.headers.get("Content-Length") or -1)
+            except (TypeError, ValueError):
+                total = -1
+            if max_bytes and total > max_bytes:
+                return None, "返回内容过大（%d 字节），不像正常的版本信息" % total
+            chunks = []
+            got = 0
+            while True:
+                piece = resp.read(65536)
+                if not piece:
+                    break
+                chunks.append(piece)
+                got += len(piece)
+                if max_bytes and got > max_bytes:
+                    return None, "返回内容过大，已中断下载"
+                if progress:
+                    progress(got, total)
+            return b"".join(chunks), None
+    except Exception as e:                       # 网络异常种类太多，一律收口
+        return None, _net_error_text(e)
+
+
+def _net_error_text(exc):
+    """把网络异常的英文报错翻成人话。用户看不懂 URLError，但看得懂「连不上」。"""
+    import urllib.error
+    name = type(exc).__name__
+    if isinstance(exc, urllib.error.HTTPError):
+        return "服务器返回 %s" % exc.code
+    if "timed out" in str(exc).lower() or name == "timeout" or "Timeout" in name:
+        return "连接超时（%d 秒没响应），多半是网络不通" % UPDATE_CONNECT_TIMEOUT
+    if "getaddrinfo" in str(exc) or "Name or service" in str(exc):
+        return "找不到服务器地址，检查网络连接"
+    return "%s：%s" % (name, exc)
+
+
+def fetch_update_info(progress=None):
+    """
+    取最新版本信息，统一成内部格式再返回。
+
+    返回 (info_dict, None) 或 (None, 错误文案)。info_dict 至少含：
+        version / notes / size / sha256 / urls(按优先级排好的下载地址列表)
+
+    两个通道都试一遍：CNB（国内，快）在先，GitHub API 在后。
+    只要有一个成功就够 —— 查询只是想知道「有没有新版」，
+    拿不到就老老实实告诉用户检查失败，不做任何猜测。
+    """
+    import json as _json
+
+    # ① CNB 上的 version.json（主通道，国内直连）
+    data, err = _http_get(UPDATE_INFO_CNB,
+                          max_bytes=UPDATE_MAX_INFO_BYTES,
+                          headers={"Accept": "application/json"},
+                          progress=progress)
+    if data:
+        try:
+            info = _json.loads(data.decode("utf-8", "replace"))
+        except Exception:
+            info = None
+        if isinstance(info, dict) and info.get("version"):
+            urls = [u for u in (info.get("cnb_url"), info.get("github_url")) if u]
+            if urls:
+                return {
+                    "version": str(info.get("version")),
+                    "tag": str(info.get("tag") or info.get("version")),
+                    "notes": info.get("notes") or "",
+                    "size": info.get("size") or 0,
+                    "sha256": info.get("sha256") or "",
+                    "urls": urls,
+                    "source": "CNB",
+                }, None
+        err = "版本信息格式不对"
+
+    # ② GitHub Release API（备用通道）
+    data, err2 = _http_get(UPDATE_INFO_GITHUB_API,
+                           max_bytes=UPDATE_MAX_INFO_BYTES,
+                           headers={"Accept": "application/vnd.github+json"},
+                           progress=progress)
+    if data:
+        try:
+            rel = _json.loads(data.decode("utf-8", "replace"))
+        except Exception:
+            rel = None
+        if isinstance(rel, dict) and rel.get("tag_name"):
+            tag = str(rel["tag_name"])
+            urls = []
+            for a in (rel.get("assets") or []):
+                u = a.get("browser_download_url")
+                if u:
+                    urls.append(u)
+            if not urls:
+                return None, "GitHub 上的新版没有可下载的附件"
+            # CNB 同版本包通常也在，拼一个放最前面，让下载也尽量走国内
+            ver = tag.lstrip("vV")
+            urls.insert(0, UPDATE_FALLBACK_CNB % (tag, tag))
+            return {
+                "version": ver,
+                "tag": tag,
+                "notes": rel.get("body") or "",
+                "size": (rel.get("assets") or [{}])[0].get("size") or 0,
+                "sha256": "",          # GitHub API 不直接给附件的 sha256
+                "urls": urls,
+                "source": "GitHub",
+            }, None
+
+    return None, err2 or err or "检查更新失败，请检查网络连接"
+
+
+AFTER_UPDATE_ARG = "--after-update"   # 更新后由旧版本拉起新版本时带的标记
+
+
+def download_update(info, progress=None):
+    """
+    把新版发布包下载到临时目录，并校验大小和 sha256。
+
+    返回 (zip 路径, None) 或 (None, 错误文案)。
+
+    校验这一步不能省：下载走的是公网，中途被篡改或下到一半断了，
+    拿一个坏包去替换正在运行的程序，等于把用户手里的东西直接毁掉。
+    有 sha256 就比 sha256（强校验），没有（走 GitHub 备用通道时拿不到）
+    也比一下文件大小 —— 弱，但总比什么都不查强。
+    """
+    import tempfile
+
+    errs = []
+    for url in info.get("urls") or []:
+        fd, path = tempfile.mkstemp(prefix="anc_upd_", suffix=".zip")
+        os.close(fd)
+        try:
+            data, err = _http_get(url, timeout=60, progress=progress)
+            if not data:
+                errs.append("%s（%s）" % (err, _host_of(url)))
+                continue
+            with open(path, "wb") as f:
+                f.write(data)
+
+            want_size = info.get("size") or 0
+            if want_size and len(data) != want_size:
+                errs.append("文件大小对不上（应 %d，实 %d）" % (want_size, len(data)))
+                continue
+
+            want_hash = (info.get("sha256") or "").strip().lower()
+            if want_hash:
+                got = hashlib.sha256(data).hexdigest()
+                if got != want_hash:
+                    errs.append("校验码对不上，文件可能被改动过，已放弃")
+                    continue
+            return path, None
+        finally:
+            # 只有成功才留着文件；失败的分支要自己收尾
+            if not (os.path.exists(path) and os.path.getsize(path)):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+    return None, "下载失败：" + "；".join(errs[:2])
+
+
+def _host_of(url):
+    """从 URL 里抠出主机名，报错时告诉用户是哪条路不通。"""
+    m = re.match(r"https?://([^/]+)", str(url or ""))
+    return m.group(1) if m else "未知地址"
+
+
+def extract_exe(zip_path, workdir):
+    """
+    从发布包里把 exe 取出来。返回 (exe 路径, None) 或 (None, 错误文案)。
+
+    发布包里除了 exe 还有使用说明、发信脚本等，只认 .exe 结尾的那一个。
+    解压用 zipfile 自己的 extract，不手写读流 —— 手写容易在
+    Zip Slip（条目名里带 ../）这类路径穿越上翻车。
+    """
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            names = [n for n in zf.namelist() if n.lower().endswith(".exe")]
+            if not names:
+                return None, "压缩包里没有找到 exe 程序"
+            name = names[0]
+            zf.extract(name, workdir)
+            exe = os.path.join(workdir, name)
+            if not os.path.exists(exe) or os.path.getsize(exe) < 100000:
+                return None, "取出的程序文件不完整"
+            return exe, None
+    except Exception as e:
+        return None, "解压失败：%s" % e
+
+
+def install_update(new_exe_path):
+    """
+    用新 exe 换掉**正在运行的自己**，然后拉起新版本。
+
+    这是整个功能里最需要小心的一步。Windows 上正在运行的 exe：
+        · **不能删除**（实测 PermissionError）
+        · **不能覆盖**
+        · **但可以重命名**（实测可以）
+    于是流程设计成：
+        1. 新 exe 先复制到「程序所在目录」的临时文件（同盘，保证移动是原子的）
+        2. 正在运行的自己改名成 xxx.exe.old  ← 这一步是关键，腾出原文件名
+        3. 临时文件就位成 xxx.exe
+        4. 启动新的 xxx.exe（带 --after-update 标记）
+        5. 调用方退出旧进程
+    全程不需要 cmd / bat 脚本 —— 中文路径（「古风倒计时.exe」）交给
+    命令行解释器处理很容易在编码上翻车，纯 Python 做就没有这问题。
+
+    第 3 步万一失败会把第 2 步回滚，绝不留一个「程序不见了」的现场。
+    .old 文件保留：万一新版本有问题，用户把它改回 .exe 就能回到老版本。
+
+    返回 (True, None) 或 (False, 错误文案)。
+    """
+    import subprocess
+
+    if not getattr(sys, "frozen", False):
+        return False, "当前是以脚本方式运行，不能自我更新（请运行打包好的 exe）"
+
+    target = os.path.abspath(sys.executable)
+    workdir = os.path.dirname(target)
+    old_path = target + UPDATE_OLD_SUFFIX
+
+    # 预检：目录能不能写。放在最前面，免得走到一半才发现没权限，
+    # 那时旧 exe 已经被改名，现场更难收拾。
+    try:
+        probe = os.path.join(workdir, ".upd_probe_%d" % os.getpid())
+        with open(probe, "wb") as f:
+            f.write(b"x")
+        os.remove(probe)
+    except Exception as e:
+        return False, ("程序所在目录没有写入权限，无法更新。\n"
+                       "请把 exe 放到普通文件夹里（不要放在 C:\\Program Files），"
+                       "或右键以管理员身份运行后再试。\n（%s）" % e)
+
+    staged = os.path.join(workdir, ".upd_new_%d.exe" % os.getpid())
+    try:
+        shutil.copyfile(new_exe_path, staged)
+        # 旧 exe 正在运行：只能改名，不能删。改完原文件名就空出来了。
+        os.replace(target, old_path)
+        try:
+            os.replace(staged, target)
+        except Exception:
+            os.replace(old_path, target)     # 回滚：把旧版本放回去
+            raise
+    except Exception as e:
+        try:
+            if os.path.exists(staged):
+                os.remove(staged)
+        except OSError:
+            pass
+        return False, "更新失败，程序保持原样：%s" % e
+
+    try:
+        subprocess.Popen([target, AFTER_UPDATE_ARG], cwd=workdir)
+    except Exception as e:
+        # 程序已经换成新的了，只是没自动起来 —— 告诉用户手动双击即可
+        return False, "新版本已就位，但没能自动启动：%s\n请手动双击 %s" % (e, target)
+    return True, None
+
+
+def wait_for_instance_lock(timeout=20.0):
+    """
+    更新后重启专用：等旧进程把单实例锁交出来。
+
+    为什么需要它：旧进程拉起新进程之后才会退出，那一瞬间互斥体还握在
+    旧进程手里。新进程一取锁就以为「已经有一个在跑」，于是按老规矩
+    唤醒它再自己退出 —— 可那个「已有实例」马上就要死了，
+    最终结果是程序彻底消失。带上 --after-update 标记的新进程走这条路，
+    轮询等锁，等到就正常启动。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.4)
+        if acquire_single_instance():
+            return True
+    return False
+
+
+def cleanup_old_exe_async():
+    """
+    后台慢慢删掉上次更新留下的 .old 文件。
+
+    必须是异步的：新进程启动时旧进程往往还没死透，.old 仍被占用，
+    这时删必然失败。要是放在启动路径上同步重试，启动就得卡好几秒，
+    这和本程序「冷启动 < 0.5 秒」的底线冲突。丢给守护线程慢慢来，
+    删不掉也无所谓，下次启动再试。
+    """
+    import threading
+
+    def worker():
+        old = os.path.abspath(sys.executable) + UPDATE_OLD_SUFFIX
+        for _ in range(24):                  # 最多等约 12 秒
+            if not os.path.exists(old):
+                return
+            try:
+                os.remove(old)
+                return
+            except OSError:
+                time.sleep(0.5)
+
+    if getattr(sys, "frozen", False):
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+
+
+SELFUPDATE_RESULT_FILE = "ac_selfupdate_result.txt"
+
+
+def run_selfupdate_cli():
+    """
+    无界面的自我更新：古风倒计时.exe selfupdate
+
+    与设置面板里「检查更新」按钮走**完全相同**的函数链
+    （fetch_update_info -> download_update -> extract_exe -> install_update），
+    只是把弹窗换成写结果文件 —— .pyw 没有控制台，print 什么都看不见。
+
+    存在的理由有两个：
+      · 测试：替换流程必须拿真 exe 在真机上走一遍，而 GUI 弹窗无法脚本驱动；
+      · 批量：十几台机器挨个点按钮也累，有了命令行就能写个循环脚本一键全升。
+
+    结果文件放在 %TEMP%，逐阶段覆写 —— 中途崩了也能看到死在哪一步。
+    退出码：0 = 无事发生或成功，1 = 失败。
+    """
+    import tempfile
+
+    rf = os.path.join(tempfile.gettempdir(), SELFUPDATE_RESULT_FILE)
+
+    def note(msg):
+        try:
+            with open(rf, "w", encoding="utf-8") as f:
+                f.write(msg)
+        except OSError:
+            pass
+
+    note("查询版本信息…")
+    info, err = fetch_update_info()
+    if err or not info:
+        note("FAIL 查询失败：%s" % err)
+        return 1
+    if not update_available(info.get("version")):
+        note("OK 已是最新版本 v%s（线上 v%s）" % (APP_VERSION, info.get("version")))
+        return 0
+    note("发现新版本 v%s（来自 %s），下载中…" % (info.get("version"),
+                                                info.get("source")))
+    zip_path, err = download_update(info)
+    if not zip_path:
+        note("FAIL 下载失败：%s" % err)
+        return 1
+    workdir = tempfile.mkdtemp(prefix="anc_upd_cli_")
+    exe, err = extract_exe(zip_path, workdir)
+    if not exe:
+        note("FAIL 解压失败：%s" % err)
+        return 1
+    note("校验通过，正在替换程序…")
+    ok, err = install_update(exe)
+    if not ok:
+        note("FAIL 更新失败：%s" % err)
+        return 1
+    note("OK 已更新到 v%s，新版本已启动" % info.get("version"))
+    return 0
 
 
 def _time_error(hour, minute):
@@ -2455,6 +2889,7 @@ class SettingsPanel:
         self._color_popup = None
         self._color_popup_for = None
         self._scroll_y = None   # 滚轮挪窗口的位移基准；None = 下次以实际位置为准
+        self._updating = False  # 正在检查/下载更新，防止重复点按钮
 
         self.win = tk.Toplevel(app.root)
         self.win.overrideredirect(True)
@@ -2485,6 +2920,11 @@ class SettingsPanel:
         self.header.pack_propagate(False)
         tk.Label(self.header, text="　設 　置", bg=pal["ink"], fg=pal["paper"],
                  font=(self.app.fam_cn, 12, "bold")).pack(side="left", padx=12)
+        # 版本号摆在标题右边：用户升完级总得有个地方确认「我到底升上没有」，
+        # 否则新旧版本界面一模一样，点了更新跟没点似的。
+        tk.Label(self.header, text="v" + APP_VERSION, bg=pal["ink"],
+                 fg=pal["border_soft"], font=("Segoe UI", 9)).pack(
+            side="left", padx=(0, 2), pady=(6, 0), anchor="sw")
         close = tk.Label(self.header, text="✕", bg=pal["ink"], fg=pal["border_soft"],
                          font=("Segoe UI", 11), cursor="hand2", padx=14)
         close.pack(side="right", fill="y")
@@ -2839,6 +3279,16 @@ class SettingsPanel:
                             font=(self.app.fam_cn, 10))
         self.msg.pack(side="left")
 
+        # 检查更新：排在「恢复出厂」左边。它天天都可能点，位置要顺手；
+        # 但也不是保存类操作，所以留在左半边，跟右侧的「保 存」分开。
+        upd = tk.Label(bar, text="检查更新", bg=pal["paper"], fg=pal["ink_soft"],
+                       font=(self.app.fam_cn, 11), cursor="hand2", padx=12, pady=6)
+        upd.pack(side="left", padx=(6, 0))
+        upd.bind("<Button-1>", lambda e: self._check_update())
+        upd.bind("<Enter>", lambda e: upd.configure(fg=pal["seal"]))
+        upd.bind("<Leave>", lambda e: upd.configure(fg=pal["ink_soft"]))
+        self.lbl_update = upd
+
         # 恢复出厂：和「取 消」同一套做法（tk.Label + bind），不引入新样式，
         # 也不加 ttk —— 面板里所有按钮都是自绘的，混进来会显得格格不入。
         # 放左边而不是挨着「保 存」：它是个危险动作，不该出现在手指习惯落点上。
@@ -3113,6 +3563,139 @@ class SettingsPanel:
             "（要送人或卸载：再取消勾选「开机自动运行」，退出程序后删掉 exe 就行。）",
             parent=self.app.root)
 
+    # ---- 在线升级 ----
+    #
+    # 联网一律走后台线程，结果再切回界面线程显示。Tk 的对象只能在主线程碰，
+    # 工作线程里直接改 Label 会随机崩，所以统一经 _update_ui 中转。
+
+    def _update_ui(self, fn):
+        """把一段界面操作排到主线程去执行。"""
+        try:
+            self.win.after(0, fn)
+        except tk.TclError:
+            pass
+
+    def _update_thread(self, worker):
+        import threading
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+
+    def _check_update(self):
+        if self._updating:
+            return
+        self._updating = True
+        self.msg.configure(text="正在检查新版本…", fg=self.pal["ink_soft"])
+        self._update_thread(self._update_query)
+
+    def _update_query(self):
+        info, err = fetch_update_info()
+        if err or not info:
+            self._update_ui(
+                lambda m=err: self._update_stop("检查更新失败：" + str(m),
+                                                self.pal["seal"]))
+            return
+        if not update_available(info.get("version")):
+            self._update_ui(
+                lambda: self._update_stop("已是最新版本 v" + APP_VERSION, "#4F7A52"))
+            return
+        self._update_ui(lambda i=info: self._update_ask(i))
+
+    def _update_stop(self, text, color):
+        self._updating = False
+        self.msg.configure(text=text, fg=color)
+
+    def _update_ask(self, info):
+        """
+        第一次确认：有没有新版、改了什么，说清楚再问要不要下。
+
+        用户明确要求「二次确认」，所以这里只问下载，不擅自开始。
+        """
+        notes = (info.get("notes") or "").strip()
+        if len(notes) > 400:
+            notes = notes[:400] + "…"
+        size_mb = (info.get("size") or 0) / 1048576.0
+        ok = messagebox.askyesno(
+            "发现新版本 v%s" % info.get("version", "?"),
+            "当前版本：v%s\n"
+            "新版本　：v%s（来自 %s）\n"
+            "下载大小：约 %.1f MB\n\n"
+            "更新内容：\n%s\n\n"
+            "现在下载并更新吗？\n"
+            "你的目标时刻、颜色规则、邮箱设置都不受影响，"
+            "更新完成后程序会自动重启一次。"
+            % (APP_VERSION, info.get("version", "?"),
+               info.get("source") or "网络", size_mb,
+               notes or "　（作者这次没写说明）"),
+            parent=self.win)
+        if not ok:
+            self._update_stop("已取消，仍是 v" + APP_VERSION, self.pal["ink_soft"])
+            return
+        self.msg.configure(text="正在下载…", fg=self.pal["ink_soft"])
+        self._update_thread(lambda: self._update_download(info))
+
+    def _update_download(self, info):
+        import tempfile
+
+        last = [0.0]
+
+        def prog(got, total):
+            # 下载每 64KB 回调一次，全量刷界面会把主线程拖死，节流到 0.3 秒一报
+            now = time.time()
+            if now - last[0] < 0.3 and (total < 0 or got < total):
+                return
+            last[0] = now
+            if total > 0:
+                text = "正在下载… %.1f / %.1f MB" % (got / 1048576.0,
+                                                     total / 1048576.0)
+            else:
+                text = "正在下载… %.1f MB" % (got / 1048576.0)
+            self._update_ui(
+                lambda t=text: self.msg.configure(text=t,
+                                                  fg=self.pal["ink_soft"]))
+
+        zip_path, err = download_update(info, progress=prog)
+        if not zip_path:
+            self._update_ui(lambda m=err: self._update_stop(
+                str(m or "下载失败"), self.pal["seal"]))
+            return
+
+        workdir = tempfile.mkdtemp(prefix="anc_upd_x_")
+        exe, err = extract_exe(zip_path, workdir)
+        if not exe:
+            self._update_ui(lambda m=err: self._update_stop(
+                str(m or "解压失败"), self.pal["seal"]))
+            return
+        self._update_ui(lambda i=info, e=exe: self._update_ready(i, e))
+
+    def _update_ready(self, info, exe):
+        """第二次确认：包已经下好且校验通过，问现在换不换。"""
+        ok = messagebox.askyesno(
+            "更新已就绪",
+            "新版本 v%s 已下载并通过校验。\n\n"
+            "现在关闭程序、切换到新版本吗？\n\n"
+            "（程序会自动重新打开。旧版本会留一个 .old 文件在旁边，"
+            "万一新版本有问题，把它改回 .exe 就能回到现在这个版本。）"
+            % info.get("version", "?"),
+            parent=self.win)
+        if not ok:
+            self._update_stop("已下载，等你决定何时重启", self.pal["ink_soft"])
+            return
+
+        ok2, err = install_update(exe)
+        if not ok2:
+            self._update_stop(str(err or "更新失败"), self.pal["seal"])
+            return
+
+        # 新版本已经在路上了，旧进程功成身退。
+        # 用 os._exit 而不是 sys.exit：此刻 tkinter 主循环还在跑，
+        # sys.exit 抛出的异常会被循环吞掉，程序退不干净。
+        try:
+            self.app._settings = None
+            self.win.destroy()
+        except Exception:
+            pass
+        os._exit(0)
+
     def close(self):
         if self._color_popup is not None:
             self._dismiss_palette(self._color_popup)
@@ -3225,13 +3808,24 @@ def main():
     # 判据放在取锁之前：发信进程不该被单实例锁挡住。
     if len(sys.argv) > 1 and sys.argv[1] == "mailer":
         return run_mailer_cli(sys.argv[1:])
+    if len(sys.argv) > 1 and sys.argv[1] == "selfupdate":
+        return run_selfupdate_cli()
+
+    after_update = AFTER_UPDATE_ARG in sys.argv
 
     if not acquire_single_instance():
-        # 已经有实例在跑：不再开新进程（每个进程要占几十 MB），
-        # 而是让已有窗口显出来——用户双击就是想看见它
-        request_wake()
-        return
+        # 更新后的那次重启特殊处理：旧进程把我们拉起来之后才退出，
+        # 它手里的互斥体还没交出来。这时若照老规矩「唤醒它再自己退出」，
+        # 被唤醒的那个马上就死了，结果就是程序消失。所以改成等锁。
+        if after_update and wait_for_instance_lock():
+            pass
+        else:
+            # 已经有实例在跑：不再开新进程（每个进程要占几十 MB），
+            # 而是让已有窗口显出来——用户双击就是想看见它
+            request_wake()
+            return
     clear_wake_file()
+    cleanup_old_exe_async()  # 上次更新留下的旧 exe，异步删，不拖慢启动
     migrate_legacy_files()   # 老版本的配置/凭据/履历文件搬进注册表（一次性）
     app = CountdownApp()
     app.run()
