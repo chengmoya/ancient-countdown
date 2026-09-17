@@ -2,7 +2,7 @@
 
 一个常驻桌面的倒计时小工具。宣纸底、古铜框、朱砂印，剩余时间越少，颜色越紧迫。
 
-纯 Python 标准库 + Tkinter 实现，**零第三方依赖**；`发布/` 目录里有打包好的单文件 exe，没有 Python 也能直接跑。
+纯 Python 标准库 + Tkinter 实现，**零第三方依赖**；发布包是打包好的单文件 exe，没有 Python 也能直接跑。
 
 ## 效果
 
@@ -29,8 +29,8 @@
 
 ### 打包版（推荐，免安装）
 
-1. 下载 `发布/古风倒计时.exe`（约 11 MB）
-2. 双击运行，窗口出现在屏幕右上方（首次启动慢两三秒是自解压，正常）
+1. 到 [Releases](https://github.com/chengmoya/ancient-countdown/releases) 页下载发布包 zip（约 11 MB），解压
+2. 双击 `古风倒计时.exe` 运行，窗口出现在屏幕右上方（首次启动慢两三秒是自解压，正常）
 3. 双击窗口（或右键 → 设置）填目标时刻，例如 `10.1`
 
 ### 源码版
@@ -57,7 +57,7 @@ python 打包.py
 | `自检.pyw` | 自检工具，排查问题时运行 |
 | `打包.py` | 一键打包 exe（含冒烟测试与自检） |
 | `使用说明.md` | 完整使用文档 |
-| `发布/` | 打包产物：exe + 便携版使用说明 |
+| `发布/` | 本地打包产物（exe 与发布包 zip 不入库，正式下载走 [Releases](https://github.com/chengmoya/ancient-countdown/releases)） |
 
 > 运行后程序旁边会生成 `countdown_config.json`（配置）、`notify_secret.json`（**邮箱授权码**）、
 > `notify_state.json`（传书履历）。这三个是你的个人数据，已列入 `.gitignore` 不会进入仓库；
