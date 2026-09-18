@@ -49,7 +49,7 @@ APP_SUB = "ANCIENT COUNTDOWN"
 # 在线升级靠它判断「有没有新版」：两边都是 "主.次" 两段数字，
 # 比较时拆成 (1, 3) 这样的小元组比大小 —— 字符串比会出事，
 # "1.10" < "1.9" 在字符串世界里是成立的，那会让用户升不上去。
-APP_VERSION = "1.4"
+APP_VERSION = "1.5"
 
 MIN_W, MIN_H = 300, 150          # 窗口最小尺寸
 RESIZE_MARGIN = 9                # 边缘拖拽感应带宽度(px)
@@ -95,8 +95,11 @@ NOTIFY_SECRET_FILE = "notify_secret.json"
 #     查询和下载就都走国内，不碰 GitHub。
 #   · tag 固定，所以 URL 永远不变；每次发版只覆盖附件内容。
 # 备用通道走 GitHub 的 Release API（匿名可读），万一 CNB 不可达还能查。
-UPDATE_INFO_CNB = ("https://cnb.cool/chengmoCNB/ancient-countdown"
-                   "/-/releases/download/update-info/version.json")
+# 演练开关：端到端测试需要一个「完全不碰线上」的版本来源，指哪儿读哪儿。
+# 平时这个环境变量不存在，就走下面的正式地址；只有测试进程里才设它。
+UPDATE_INFO_CNB = (os.environ.get("ANCIENT_COUNTDOWN_UPDATE_INFO")
+                   or "https://cnb.cool/chengmoCNB/ancient-countdown"
+                      "/-/releases/download/update-info/version.json")
 UPDATE_INFO_GITHUB_API = ("https://api.github.com/repos/chengmoya"
                           "/ancient-countdown/releases/latest")
 UPDATE_FALLBACK_CNB = ("https://cnb.cool/chengmoCNB/ancient-countdown"
@@ -104,6 +107,26 @@ UPDATE_FALLBACK_CNB = ("https://cnb.cool/chengmoCNB/ancient-countdown"
 UPDATE_CONNECT_TIMEOUT = 12      # 连不上就别让用户干等
 UPDATE_MAX_INFO_BYTES = 200000   # 版本信息不可能超过这个数，防异常响应
 UPDATE_OLD_SUFFIX = ".old"       # 旧 exe 被改名后的后缀（保留以便回滚）
+
+# ---- 自动检查更新（静默，绝不打扰）----
+#
+# 这一套的底线是：**它出任何问题都不能影响倒计时本身**。
+# 所以查询失败一律静默吞掉（不弹窗、不在界面上写错误文字），
+# 而且只在「距上次真查过 ≥ 7 天」时才碰网络 —— 绝大多数巡检
+# 只是一次减法，连注册表都不用读。
+UPDATE_CHECK_KEY = "update_check"        # 自动检查的状态（存注册表）
+UPDATE_AUTO_START_DELAY = 60             # 启动后静置多少秒才开始自动检查
+UPDATE_AUTO_SCAN_SEC = 6 * 3600          # 巡检间隔：每 6 小时醒一次看看该不该查
+UPDATE_CHECK_MIN_GAP = 7 * 86400         # 两次真查询之间至少隔 7 天
+
+# ---- 更新后的「可回滚窗口」----
+#
+# .old 是用户唯一的回滚手段，所以不能新版本一启动就删：
+# 用户说的「新版有问题」往往不是「起不来」（起不来时这段代码根本跑不到），
+# 而是「起来了但功能不对」—— 那种情况下 .old 要是已经没了，想退都退不回去。
+UPDATE_GUARD_KEY = "update_guard"        # 更新后的成功启动计数（存注册表）
+UPDATE_GUARD_RUNS = 3                    # 稳定启动满几次才把 .old 删掉
+UPDATE_GUARD_DELAY_MS = 60 * 1000        # 启动后满多久才算「这一次启动成功了」
 
 # 常见邮箱的 SMTP 参数：(显示名, 服务器, 端口, 是否 SSL)
 # 选服务商只填邮箱地址和授权码即可，服务器参数自动带出
@@ -133,6 +156,9 @@ DEFAULT_CONFIG = {
     "locked": False,             # 锁定窗口尺寸
     "always_on_top": True,
     "autostart": False,          # 开机自动运行（真实状态以注册表为准，此为笔录）
+    # 自动检查新版本：默认开着，但用户可以随时在设置面板里关掉。
+    # 关掉之后程序不会再主动联网，只剩手动点「检查更新」这一条路。
+    "auto_update_check": True,
     "window": {"x": None, "y": None, "w": 620, "h": 300},
 
     "palette": {
@@ -1178,6 +1204,7 @@ def download_update(info, progress=None):
     for url in info.get("urls") or []:
         fd, path = tempfile.mkstemp(prefix="anc_upd_", suffix=".zip")
         os.close(fd)
+        keep = False             # 只有校验通过的包才留下，其余一律删掉
         try:
             data, err = _http_get(url, timeout=60, progress=progress)
             if not data:
@@ -1197,10 +1224,13 @@ def download_update(info, progress=None):
                 if got != want_hash:
                     errs.append("校验码对不上，文件可能被改动过，已放弃")
                     continue
+            keep = True
             return path, None
         finally:
-            # 只有成功才留着文件；失败的分支要自己收尾
-            if not (os.path.exists(path) and os.path.getsize(path)):
+            # 收尾必须用 keep 标记，不能靠「文件存在且非空」来判断：
+            # 大小 / sha256 校验失败时文件已经写进去了，那个条件不成立，
+            # 坏包就永远留在 %TEMP% 里（每个 11 MB，试几条地址就堆几十兆）。
+            if not keep:
                 try:
                     os.remove(path)
                 except OSError:
@@ -1257,7 +1287,8 @@ def install_update(new_exe_path):
     命令行解释器处理很容易在编码上翻车，纯 Python 做就没有这问题。
 
     第 3 步万一失败会把第 2 步回滚，绝不留一个「程序不见了」的现场。
-    .old 文件保留：万一新版本有问题，用户把它改回 .exe 就能回到老版本。
+    .old 不会立刻删掉（它是用户唯一的退路）：要等新版连续稳定启动满
+    UPDATE_GUARD_RUNS 次，才由 note_successful_run 清掉。
 
     返回 (True, None) 或 (False, 错误文案)。
     """
@@ -1334,9 +1365,9 @@ def wait_for_instance_lock(timeout=20.0):
     return False
 
 
-def cleanup_old_exe_async():
+def delete_old_exe_async():
     """
-    后台慢慢删掉上次更新留下的 .old 文件。
+    后台慢慢删掉更新留下的 .old 文件。
 
     必须是异步的：新进程启动时旧进程往往还没死透，.old 仍被占用，
     这时删必然失败。要是放在启动路径上同步重试，启动就得卡好几秒，
@@ -1359,6 +1390,124 @@ def cleanup_old_exe_async():
     if getattr(sys, "frozen", False):
         t = threading.Thread(target=worker, daemon=True)
         t.start()
+
+
+def guard_step(guard, version, needed=UPDATE_GUARD_RUNS):
+    """
+    算出「这一次启动之后该记成第几次」，以及要不要动 .old。
+
+    单独抽出来是因为它是这套机制里唯一有分支的地方（版本换了要重新数），
+    而删文件那一步在脚本模式下跑不了（见下）。把判定和动作分开，
+    规则就能被测试钉住，不必真的去删一个 exe。
+
+    返回 (新计数, 是否该删 .old)。
+    """
+    runs = 0
+    # 版本对不上就从头数：换了一版就该重新给用户三回机会
+    if isinstance(guard, dict) and guard.get("version") == version:
+        try:
+            runs = int(guard.get("ok_runs") or 0)
+        except (TypeError, ValueError):
+            runs = 0
+    runs += 1
+    return runs, runs >= needed
+
+
+def note_successful_run():
+    """
+    新版本稳定启动了一次 —— 记一笔；攒够次数才把 .old 删掉。
+
+    为什么不当场删（早先就是这么干的，已改）：那个 .old 是用户唯一的回滚手段，
+    删早了等于把退路提前烧掉 —— 新版「起来了但功能不对」的时候，
+    用户连把 .old 改回 .exe 的机会都没有。
+
+    计数必须落注册表：它是跨进程、跨重启的状态，放内存里一关就忘光了。
+    调用点在启动满 UPDATE_GUARD_DELAY_MS 之后（见 CountdownApp 的定时器），
+    于是「新版本启动几十秒内就崩」那种情况根本走不到这里 —— 这一笔不算数，
+    计数停在原地，.old 留着。正是我们想要的。
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    old = os.path.abspath(sys.executable) + UPDATE_OLD_SUFFIX
+    if not os.path.exists(old):
+        # 没有旧版本可回滚（首次安装，或上次已经清干净）—— 顺手清掉计数残留
+        reg_store_delete(UPDATE_GUARD_KEY)
+        return
+
+    guard = reg_store_read(UPDATE_GUARD_KEY, {})
+    runs, should_delete = guard_step(guard, APP_VERSION)
+
+    if should_delete:
+        # 删成功才清计数。删不掉就留着计数下次启动接着试，
+        # 免得又要从头攒三回。
+        try:
+            os.remove(old)
+        except OSError:
+            reg_store_write(UPDATE_GUARD_KEY,
+                            {"version": APP_VERSION, "ok_runs": runs})
+            return
+        reg_store_delete(UPDATE_GUARD_KEY)
+        return
+
+    reg_store_write(UPDATE_GUARD_KEY, {"version": APP_VERSION, "ok_runs": runs})
+
+
+def last_auto_check_ts():
+    """上次自动检查真的查通了的时间戳；没查过返回 0。"""
+    rec = reg_store_read(UPDATE_CHECK_KEY, {})
+    if not isinstance(rec, dict):
+        return 0.0
+    try:
+        return float(rec.get("last_ts") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def remembered_new_version():
+    """
+    上次自动检查看到的线上版本号 —— 但它**只有确实比本机新**才算数。
+
+    这个判据顺带解决了一件事：用户升级完成之后 APP_VERSION 就跟着变了，
+    这里自然返回空，右上角那颗小红点自己就消失，
+    不需要任何额外的清理动作，也就没有「红点擦不掉」的可能。
+    """
+    rec = reg_store_read(UPDATE_CHECK_KEY, {})
+    if not isinstance(rec, dict):
+        return ""
+    ver = str(rec.get("version") or "")
+    return ver if update_available(ver) else ""
+
+
+def note_auto_check(ver):
+    """记下「自动检查过了」：时间戳用来限频，版本号用来点亮小红点。"""
+    reg_store_write(UPDATE_CHECK_KEY,
+                    {"last_ts": time.time(), "version": str(ver or "")})
+
+
+def log_problem(tag, exc_type, exc_value, exc_tb):
+    """
+    把一条异常写进崩溃日志 —— windowed exe 唯一的「留痕」手段。
+
+    为什么非要自己动手：`--windowed` 打包出来没有控制台，而 Tk 的 after
+    回调里抛出的异常会被它默认的 report_callback_exception 悄悄丢掉，
+    连 PyInstaller 那个 Error 弹框都不会出现。表现就是「窗口还开着，
+    但数字不走了」，且一点线索都不留。这种事只能靠主动接管来暴露。
+
+    界面上一个字都不写：这些都是后台的杂事，用户没要求、也不该被打扰。
+    """
+    import traceback
+    try:
+        path = os.path.join(tempfile.gettempdir(), "ac_crash.log")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n[%s] %s\n" % (tag, _stamp()))
+            traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
+    except Exception:                         # noqa: BLE001
+        pass
+
+
+def note_scan_error(exc):
+    """自动检查更新踩了坑 —— 交给上面那个统一的留痕函数。"""
+    log_problem("自动检查更新", type(exc), exc, exc.__traceback__)
 
 
 SELFUPDATE_RESULT_FILE = "ac_selfupdate_result.txt"
@@ -1659,9 +1808,19 @@ class CountdownApp:
         self.gear_hover = False
         self._settings = None
 
+        # 自动检查更新的状态全部落在注册表：限频时间戳、上次看到的线上版本。
+        # 这里只读两个值，毫秒级，对启动速度没有可感影响；
+        # new_version 必须赶在 _place_window 之前定好，因为右上角那颗小红点
+        # 是随窗口重绘一起画出来的。
+        self.new_version = remembered_new_version()
+        self._update_scan_at = time.time() + UPDATE_AUTO_START_DELAY
+
         self.root = tk.Tk()
         self.root.title(APP_NAME)
         self.root.overrideredirect(True)               # 无系统边框，纯自绘
+        # windowed exe 没有控制台，Tk 回调里抛出的异常默认会被悄悄丢掉
+        # （表现成「窗口还开着，数字不走了」，却查不出任何原因）。接管它。
+        self.root.report_callback_exception = self._on_tk_error
         pal = self.cfg["palette"]
         self.root.configure(bg=pal["ink"])
         self.root.attributes("-topmost", bool(self.cfg.get("always_on_top", True)))
@@ -1691,6 +1850,10 @@ class CountdownApp:
         self.root.update_idletasks()
         self.layout()
         self.tick()
+
+        # 启动满 60 秒才算「这一次启动成功了」—— 既给新版本留一个暴露崩溃的
+        # 机会窗口，也是 .old 保留计数（note_successful_run）唯一的入口。
+        self.root.after(UPDATE_GUARD_DELAY_MS, self._note_run_ok)
 
     # ---------------- 初始化 ----------------
 
@@ -1941,13 +2104,28 @@ class CountdownApp:
                                     fill=self._ink_tone("faint"))
 
     def _draw_gear(self, W, H):
-        """右上角「設」字入口。"""
+        """
+        右上角「設」字入口。自动检查发现新版本时，旁边点一颗朱砂小点。
+
+        整组图元统一挂 "gear" 标签、动手前先删干净：鼠标进出这个区域会被
+        反复重画（见 _mouse_move），不先删就会一层层叠上去。
+        """
         pal = self.cfg["palette"]
         m = max(7, int(min(W, H) * 0.030))
         self.f_gear.configure(size=max(10, min(15, int(H * 0.058))))
         self._gear_pos = (W - m - 20, m + 19)
         color = pal["seal"] if self.gear_hover else self._ink_tone("faint")
-        self.canvas.create_text(*self._gear_pos, text="設", font=self.f_gear, fill=color)
+        self.canvas.delete("gear")
+        self.canvas.create_text(*self._gear_pos, text="設", font=self.f_gear,
+                                fill=color, tags="gear")
+        if self.new_version:
+            # 只点一颗小点：不写字、不弹窗。想升级的人自然会去点「設」，
+            # 不想升级就一直是一颗点，不打扰。
+            gx, gy = self._gear_pos
+            r = max(2.5, min(W, H) * 0.011)
+            cx, cy = gx + r * 3.0, gy - r * 3.0
+            self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                    fill=pal["seal"], outline="", tags="gear")
 
     def _draw_seal(self, W, H):
         """右下角朱砂印。"""
@@ -2154,6 +2332,18 @@ class CountdownApp:
             self._last_notify_check = clock
             self.notify_tick(now)
 
+        # 自动检查更新：启动后先静置 60 秒，之后每 6 小时醒一次。
+        # 醒来也不一定真查 —— 要不要发网络请求，得看「距上次查通满没满 7 天」，
+        # 而那只是一次注册表读。绝大多数巡检到这里就是一次时间戳比较。
+        if clock >= self._update_scan_at:
+            self._update_scan_at = clock + UPDATE_AUTO_SCAN_SEC
+            try:
+                self.auto_update_scan()
+            except Exception as exc:          # noqa: BLE001
+                # 这一段绝不允许拖垮 tick —— tick 一断，倒计时就彻底不动了。
+                # 为了一个「顺带检查更新」把主功能赔进去，那是本末倒置。
+                note_scan_error(exc)
+
         if self.target is None:
             stamp = ("err", self.parse_err)
             theme = None
@@ -2187,6 +2377,93 @@ class CountdownApp:
         else:
             delay = max(30, 1000 - now.microsecond // 1000)
         self.root.after(delay, self.tick)
+
+    # ---------------- 在线升级 · 自动部分 ----------------
+
+    def _on_tk_error(self, exc_type, exc_value, exc_tb):
+        """
+        Tk 回调（包括 tick）里没接住的异常。
+
+        没有它的话，任何一次意外都会让 after 链断掉 —— 倒计时从此不再刷新，
+        而用户看不见、我们也查不到。
+        """
+        log_problem("Tk 回调", exc_type, exc_value, exc_tb)
+
+    def _note_run_ok(self):
+        """
+        启动满 60 秒后走这里：给 .old 的保留计数 +1，攒够次数才真的删。
+
+        刻意放在定时器里而不是启动路径上：一是要把「起不来」和「起来了」
+        分开 —— 崩在启动阶段的版本不该拿到这一笔；二是注册表写和可能的
+        重试都不该挤在启动那几百毫秒里。
+        """
+        try:
+            note_successful_run()
+        except Exception as exc:             # noqa: BLE001
+            note_scan_error(exc)             # 不留痕的话，出事就只能靠猜
+
+    def set_new_version(self, ver):
+        """
+        记下「线上有新版本」，并同步右上角那颗小红点。
+
+        传空、或传一个不比本机新的版本号，就是把红点灭掉 ——
+        手动点到「已是最新版本」之后走的就是这条路。
+        """
+        known = str(ver or "")
+        if not update_available(known):
+            known = ""
+        if known == self.new_version:
+            return
+        self.new_version = known
+        try:
+            self._draw_gear(self.W, self.H)
+        except Exception:                    # noqa: BLE001
+            pass
+
+    def auto_update_scan(self):
+        """
+        自动检查的巡检：先判断该不该查，该查才起后台线程。
+
+        三条底线（比这个功能本身重要）：
+          · 绝不弹窗、绝不在界面上写任何失败文字；
+          · 绝不阻塞界面线程 —— 真正的查询在后台线程里跑；
+          · 出任何意外都就地吞掉，倒计时该怎么走还怎么走。
+        """
+        if not self.cfg.get("auto_update_check", True):
+            return
+        if time.time() - last_auto_check_ts() < UPDATE_CHECK_MIN_GAP:
+            return                           # 7 天内查过，读到这儿就收工
+
+        def worker():
+            try:
+                info, err = fetch_update_info()
+            except Exception as exc:         # noqa: BLE001
+                note_scan_error(exc)
+                return
+            if err or not info:
+                # 没查通（断网、通道抽风）不算异常，但值得留一行痕：
+                # 用户说「一直没提示更新」时，第一件事就是来看这里。
+                note_scan_error(RuntimeError("查询没通：%s"
+                                             % (err or "没有返回内容")))
+                return
+            ver = str(info.get("version") or "")
+            try:
+                note_auto_check(ver)
+            except Exception as exc:         # noqa: BLE001
+                note_scan_error(exc)
+                return
+            if not update_available(ver):
+                return                       # 已是最新：连界面都不用碰
+            try:
+                self.root.after(0, lambda v=ver: self.set_new_version(v))
+            except Exception as exc:         # noqa: BLE001
+                note_scan_error(exc)
+
+        import threading
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:                    # noqa: BLE001
+            pass
 
     # ---------------- 窗口拖拽 / 缩放 ----------------
 
@@ -3010,9 +3287,12 @@ class SettingsPanel:
         self.var_top = tk.BooleanVar(value=bool(app.cfg.get("always_on_top", True)))
         # 自启勾选框的初值读注册表现状而非配置：启动项被清掉时不能显示假状态
         self.var_autostart = tk.BooleanVar(value=is_autostart_on())
+        self.var_autoupd = tk.BooleanVar(
+            value=bool(app.cfg.get("auto_update_check", True)))
         for var, text in ((self.var_lock, "锁定窗口尺寸（禁止拖拽边缘缩放）"),
                           (self.var_top, "窗口总在最前"),
-                          (self.var_autostart, "开机自动运行（写入当前用户启动项）")):
+                          (self.var_autostart, "开机自动运行（写入当前用户启动项）"),
+                          (self.var_autoupd, "自动检查新版本（每七天一次，静默不打扰）")):
             tk.Checkbutton(self.body, text="  " + text, variable=var,
                            bg=pal["paper"], fg=pal["ink"], selectcolor="#FFFBF2",
                            activebackground=pal["paper"], activeforeground=pal["seal"],
@@ -3298,12 +3578,21 @@ class SettingsPanel:
 
         # 检查更新：排在「恢复出厂」左边。它天天都可能点，位置要顺手；
         # 但也不是保存类操作，所以留在左半边，跟右侧的「保 存」分开。
-        upd = tk.Label(bar, text="检查更新", bg=pal["paper"], fg=pal["ink_soft"],
-                       font=(self.app.fam_cn, 11), cursor="hand2", padx=12, pady=6)
+        # 自动检查要是已经发现新版本，就把版本号直接写在按钮上 ——
+        # 用户不必点进去才知道有新版。
+        pending = getattr(self.app, "new_version", "")
+        base_fg = pal["seal"] if pending else pal["ink_soft"]
+        base_font = ((self.app.fam_cn, 11, "bold") if pending
+                     else (self.app.fam_cn, 11))
+        upd = tk.Label(bar, text=("发现新版本 v" + pending) if pending else "检查更新",
+                       bg=pal["paper"], fg=base_fg, font=base_font,
+                       cursor="hand2", padx=12, pady=6)
         upd.pack(side="left", padx=(6, 0))
         upd.bind("<Button-1>", lambda e: self._check_update())
         upd.bind("<Enter>", lambda e: upd.configure(fg=pal["seal"]))
-        upd.bind("<Leave>", lambda e: upd.configure(fg=pal["ink_soft"]))
+        # 离开时要回到它本来的颜色，不能一律写成灰的 ——
+        # 有新版提示时它本来就是朱砂色，写死灰色会让提示凭空消失。
+        upd.bind("<Leave>", lambda e: upd.configure(fg=base_fg))
         self.lbl_update = upd
 
         # 恢复出厂：和「取 消」同一套做法（tk.Label + bind），不引入新样式，
@@ -3533,6 +3822,10 @@ class SettingsPanel:
             return
         notify_cfg, secret = pair
 
+        # 自动检查开关不动 apply_settings 的签名（那会牵动一圈调用点），
+        # 直接改在 cfg 上 —— apply_settings 末尾本来就会 save_config 落盘。
+        self.app.cfg["auto_update_check"] = bool(self.var_autoupd.get())
+
         err = self.app.apply_settings(self.entry.get(), thresholds,
                                       self.var_lock.get(), self.var_top.get(),
                                       self.var_autostart.get(),
@@ -3612,9 +3905,13 @@ class SettingsPanel:
                                                 self.pal["seal"]))
             return
         if not update_available(info.get("version")):
+            # 手动查到「已是最新」，顺手把右上角那颗小红点灭掉。
+            # 必须经 _update_ui 回主线程 —— 这里跑在后台线程上，直接碰 canvas 会崩。
+            self._update_ui(lambda: self.app.set_new_version(""))
             self._update_ui(
                 lambda: self._update_stop("已是最新版本 v" + APP_VERSION, "#4F7A52"))
             return
+        self._update_ui(lambda: self.app.set_new_version(info.get("version")))
         self._update_ui(lambda i=info: self._update_ask(i))
 
     def _update_stop(self, text, color):
@@ -3691,7 +3988,8 @@ class SettingsPanel:
             "新版本 v%s 已下载并通过校验。\n\n"
             "现在关闭程序、切换到新版本吗？\n\n"
             "（程序会自动重新打开。旧版本会留一个 .old 文件在旁边，"
-            "万一新版本有问题，把它改回 .exe 就能回到现在这个版本。）"
+            "新版连续正常启动几回之后才会自动清掉它 —— "
+            "在那之前把 .old 改回 .exe 就能退回现在这个版本。）"
             % info.get("version", "?"),
             parent=self.win)
         if not ok:
@@ -3877,7 +4175,8 @@ def main():
             request_wake()
             return
     clear_wake_file()
-    cleanup_old_exe_async()  # 上次更新留下的旧 exe，异步删，不拖慢启动
+    # 旧 exe（.old）不在这儿清了：它现在是「新版本连续稳定启动满几次」才删，
+    # 触发点挂在窗口起来 60 秒之后（见 note_successful_run / _note_run_ok）。
     migrate_legacy_files()   # 老版本的配置/凭据/履历文件搬进注册表（一次性）
     app = CountdownApp()
     app.run()
