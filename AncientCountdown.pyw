@@ -1102,6 +1102,15 @@ def fetch_update_info(progress=None):
             info = None
         if isinstance(info, dict) and info.get("version"):
             urls = [u for u in (info.get("cnb_url"), info.get("github_url")) if u]
+            # 兜底一条：按 tag 拼出 CNB 的附件地址。
+            # version.json 里那两条地址是发版脚本拼的，错一个字母就是 404 ——
+            # v1.4 真踩过：附件叫 AncientCountdown_v1.4.zip，脚本写成了
+            # _1.4.zip，两条地址全废，用户能看到新版却下不下来。
+            # 这条按约定从 tag 拼，多一道保险；就算拼错了也不要紧，
+            # download_update 会拿 size/sha256 把它拦下来。
+            _tag = str(info.get("tag") or "").strip()
+            if _tag:
+                urls.append(UPDATE_FALLBACK_CNB % (_tag, _tag))
             if urls:
                 return {
                     "version": str(info.get("version")),
