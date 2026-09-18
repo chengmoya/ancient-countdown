@@ -21,6 +21,7 @@ spec_*/
 build/
 dist/
 上一版*.exe
+上一版*.zip
 
 # ==== 发布产物改走 GitHub Releases,不再入库 ====
 发布/古风倒计时.exe
