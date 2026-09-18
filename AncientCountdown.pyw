@@ -35,6 +35,7 @@ import sys
 import time
 import winreg
 import tkinter as tk
+from tkinter import filedialog
 from tkinter import font as tkfont
 from tkinter import messagebox
 
@@ -49,12 +50,25 @@ APP_SUB = "ANCIENT COUNTDOWN"
 # 在线升级靠它判断「有没有新版」：两边都是 "主.次" 两段数字，
 # 比较时拆成 (1, 3) 这样的小元组比大小 —— 字符串比会出事，
 # "1.10" < "1.9" 在字符串世界里是成立的，那会让用户升不上去。
-APP_VERSION = "1.5"
+APP_VERSION = "1.6"
 
 MIN_W, MIN_H = 300, 150          # 窗口最小尺寸
+# 数字字号的下限。宁可让它稍微顶出一点，也不缩到看不清：
+# 这个挂件的全部用途就是那一串数字，缩成蚂蚁大小等于没用。
+MIN_NUM_SIZE = 12
 RESIZE_MARGIN = 9                # 边缘拖拽感应带宽度(px)
 TICK_IDLE_MS = 600               # 归零状态闪烁间隔
 MIN_VISIBLE_W, MIN_VISIBLE_H = 140, 70   # 窗口在桌面内的最小露出尺寸，不足即视为「跑到屏幕外」
+
+# 右上角三个按钮（設 / — / ✕）的命中框与圆心间距。
+# 窗口是无边框的，按钮只能自己画、自己判命中，所以这里定死一套尺寸：
+# CTRL_HIT 是「离圆心这么近就算点中」，宁可稍微宽松一点，手指头不必点准圆心；
+# CTRL_STEP_MIN 是两枚按钮圆心之间的最小距离，窗口再小也不许更挤 ——
+# 必须**严格大于 2×CTRL_HIT**，否则两枚按钮的命中框会搭在一起：
+# 手指落在夹缝里会同时压中两个按钮，而「✕」就在最外侧，
+# 一次误触直接退出程序 —— 这种代价不能靠「应该点不准」来赌。
+CTRL_HIT = 12
+CTRL_STEP_MIN = 30
 
 # 单实例名后面会拼上数据目录的路径指纹（见 acquire_single_instance）：
 # 这样「演练实例」和「真正在用的实例」互不干扰，否则跑一次自检就会
@@ -84,6 +98,32 @@ NOTIFY_RESULT_FILE = "notify_result.json"
 NOTIFY_TEST_RESULT_FILE = "notify_test_result.json"
 NOTIFY_STATE_FILE = "notify_state.json"
 NOTIFY_SECRET_FILE = "notify_secret.json"
+
+# ---- 多机共用设置 ----
+#
+# 场景：十来台机器要配一模一样的颜色、传书设置，只有「本机抬头」和
+# 「目标时刻」刻意各不相同。做法是把设置导出成一份文件，挨台机器喂一次：
+#
+#   A 机调好 → 设置面板「导出共用设置…」→ 挑好带哪些项 → 得一个 共用设置.json
+#   → 拷到 B 机 → B 机上打开设置面板「从文件导入…」选中它 → 当场生效
+#
+# 导入**必须手动**，这一点是用户明确定的（v1.6 改掉的第一版做法）：
+# 早期做成「启动时扫 exe 旁边、有就读走并删掉」，听着省事，实际很危险 ——
+#   · 只要那份文件还在（比如拷过来还没来得及启、或者启了但没读成），
+#     每一次启动都会再覆盖一遍，这台机器上独有的设置永远留不住；
+#   · 出了事用户根本想不到是「旁边那个文件」干的，排查方向完全错。
+# 改成手动挑文件之后，什么时候导、导哪一份，都是当场看见、当场决定的；
+# 而且不删用户那份文件 —— 他很可能就是留着当母本的。
+#
+# 导出时还能一项一项挑（见 SHARED_ITEMS）：没勾的那一项根本不进文件，
+# 也就不可能覆盖对方机器上那一项。
+SHARED_FILE = "共用设置.json"
+SHARED_SCHEMA = 1
+# 这几个键名都指注册表里的值，不是用户配置：
+#   shared_last      最近一次导入的结果（设置面板里显示给用户看）
+#   shared_error     最近一次导入失败的原因（同样是给人看的）
+SHARED_LAST_KEY = "shared_last"
+SHARED_ERR_KEY = "shared_error"
 
 # ---- 在线升级 ----
 #
@@ -312,6 +352,22 @@ def set_geometry(widget, w, h, x, y):
     """同时定尺寸和位置（位置允许为负，见 set_window_pos）。"""
     widget.geometry("%dx%d" % (int(w), int(h)))
     set_window_pos(widget, x, y)
+
+
+def chrome_hidden(win):
+    """
+    这个窗口现在是不是「自绘无边框」——即系统标题栏已经被取消。
+
+    为什么不用 win.overrideredirect() 直接查：tkinter 那层封装把 Tcl 返回的
+    "0" 读成了 None，于是「边框已交还给系统」时拿到的是 None 而不是 False，
+    写 `is False` 的断言永远不成立 —— 测试会报一个看不出原因的假失败
+    （2026-09-19 最小化功能自检就这样卡了一轮）。直接问 Tcl 得到的是干净的
+    "1"/"0"，不存在这个歧义。
+    """
+    try:
+        return str(win.tk.call("wm", "overrideredirect", win._w)).strip() in ("1", "true", "True")
+    except Exception:
+        return False
 
 
 def acquire_single_instance():
@@ -569,6 +625,304 @@ def reset_factory_data():
 
 
 # --------------------------------------------------------------------------
+# 共用设置 · 多台机器同步同一份配置
+#
+# 一份文件搬来搬去，规矩只有三条：
+#   ① 文件放 exe 旁边，启动时读进去（读到就吃，吃完就删）
+#   ② 本机抬头与开机自启**永不**被这份文件改掉 —— 它们天生各机不同
+#   ③ 文件里带着邮箱授权码（明文），所以它和密钥同级看待，绝不入库
+#
+# 为什么不做成「常驻的配置文件」而是「读一次就销毁」：
+# 常驻的话，用户在界面上改的设置下一次启动就被文件盖回去，会显得
+# 「改了不生效」；而且程序目录里会永远多出一个文件。读一次吃一次，
+# 文件只承担「投喂」这一个角色，两边都不别扭。
+# --------------------------------------------------------------------------
+
+SHARED_NOTE = (
+    "这份文件是「古风倒计时」的跨机器设置，由设置面板的「导出共用设置」生成。\n"
+    "拷到另一台机器上之后，在那台机器的设置面板里点「从文件导入…」选中它，\n"
+    "设置当场生效。程序不会自己去找这个文件、也不会删它 —— 什么时候导入、\n"
+    "导哪一份，都由你当场决定。\n"
+    "· 导出时可以一项一项挑，下面「include」写的就是这一份带了哪些项；\n"
+    "  没带的那些，对方机器上原来的设置会原样保留，不会被这里覆盖。\n"
+    "· 本机抬头（寄信署名）不在这个文件里，每台机器各自设。\n"
+    "· 开机自启也不在里面，那是每台机器自己的事。\n"
+    "· 文件里可能有邮箱授权码，是明文。别放进公共网盘、别发到群里。\n"
+    "· 想改内容就用记事本改（存成 UTF-8），再拷给别的机器。改坏了程序会\n"
+    "  拒绝读入，并且故意不删文件，方便你改回来。"
+)
+
+
+# 导出时可以一项一项挑 —— 见 build_shared_bundle 的 selection 参数。
+#
+# 为什么要能挑：用户手上是一批机器，绝大多数设置想配成一样，可「目标时刻」
+# 偏偏是每台各不相同的（每台在倒计自己的事）。不挑的话，一次同步就把所有
+# 机器的时刻冲成同一个 —— 那正是最不能出的事。
+#
+# 语义是「剔除」而不是「只留」：没勾的项从包里删掉，没在这张表里的键照常
+# 带着走。这样以后新增了配置项，也会自动跟着同步，不会静默漏掉。
+SHARED_ITEMS = (
+    {"key": "target", "label": "目标时刻", "default": False,
+     "hint": "每台机器倒计的事多半不一样，默认不带",
+     "drop": (("config", "target"),)},
+    {"key": "thresholds", "label": "颜色规则", "default": True,
+     "hint": "剩几天时换成什么颜色",
+     "drop": (("config", "thresholds"),)},
+    {"key": "palette", "label": "配色", "default": True,
+     "hint": "宣纸底色、墨色、朱砂这一整套颜色",
+     "drop": (("config", "palette"),)},
+    {"key": "zero", "label": "归零时的文字与颜色", "default": True,
+     "hint": "「時辰已到」这行字和它闪的颜色",
+     "drop": (("config", "zero_text"), ("config", "zero_color"),
+              ("config", "zero_color_alt"))},
+    {"key": "notify", "label": "鸿雁传书设置", "default": True,
+     "hint": "服务商、发件与收件邮箱、提醒档位（本机抬头不带）",
+     "drop": (("config", "notify"),)},
+    {"key": "secret", "label": "邮箱授权码", "default": True,
+     "hint": "明文写进文件里：别放公共网盘、别发到群里",
+     "drop": (("notify_secret",),)},
+    {"key": "pins", "label": "锁定与置顶", "default": True,
+     "hint": "是否锁定尺寸、是否总在最前",
+     "drop": (("config", "locked"), ("config", "always_on_top"))},
+    {"key": "window", "label": "窗口位置与大小", "default": True,
+     "hint": "各机器屏幕不一样的话可以不带",
+     "drop": (("config", "window"),)},
+    {"key": "autoupdate", "label": "自动检查更新", "default": True,
+     "hint": "是否开机后自己去找新版本",
+     "drop": (("config", "auto_update_check"),)},
+)
+
+# 上次导出勾了哪几项，也记在注册表里（不是用户设置，只是个记忆）
+SHARED_ITEMS_KEY = "shared_export_items"
+
+
+def shared_item_keys():
+    """所有可选项的 key，按界面上的显示顺序。"""
+    return [it["key"] for it in SHARED_ITEMS]
+
+
+def default_shared_selection():
+    """默认勾哪些：除「目标时刻」外全勾。"""
+    return dict((it["key"], bool(it["default"])) for it in SHARED_ITEMS)
+
+
+def load_shared_selection():
+    """
+    上次导出时勾了哪几项；从没导过就用默认值（缺的项按默认补上）。
+
+    记住它有实际意义：一次要给十来台机器配，每次都重新勾一遍很烦，
+    而每次要的又几乎总是同一套。
+    """
+    sel = default_shared_selection()
+    saved = reg_store_read(SHARED_ITEMS_KEY, {})
+    if isinstance(saved, dict):
+        for key in sel:
+            if key in saved:
+                sel[key] = bool(saved[key])
+    return sel
+
+
+def save_shared_selection(sel):
+    """把勾选结果记下来，下次打开导出窗口时还是这一套。"""
+    if isinstance(sel, dict):
+        reg_store_write(SHARED_ITEMS_KEY,
+                        dict((k, bool(v)) for k, v in sel.items()))
+
+
+def _drop_shared_path(bundle, path):
+    """按路径从包里删掉一项；路径上哪一层不存在就安静地什么都不做。"""
+    node = bundle
+    for name in path[:-1]:
+        if not isinstance(node, dict) or name not in node:
+            return
+        node = node[name]
+    if isinstance(node, dict):
+        node.pop(path[-1], None)
+
+
+def shared_file_path():
+    """共用设置文件在哪儿：程序（数据）目录下。演练时跟着改道走。"""
+    return os.path.join(DATA_DIR, SHARED_FILE)
+
+
+def build_shared_bundle(cfg, secret, selection=None):
+    """
+    攒出「可以搬去别的机器」的那部分设置。
+
+    selection 是导出界面上勾的项目（形如 {"target": False, ...}）：
+      · 传 None = 全带（老代码与测试走这条路）
+      · 传了就按勾选项剔除 —— 没勾的项根本不进文件，
+        也就不可能覆盖对方机器上那一项。
+
+    搬什么、不搬什么，是这段逻辑最要紧的地方：
+
+      搬：目标时刻、颜色规则、配色、传书设置（服务商/账号/收件人/档位）、
+          锁定与置顶、窗口大小与位置（具体带哪几项由 selection 定）。
+      不搬 notify.signature（本机抬头）—— 各台机器刻意不同，搬过去会把
+          对方的抬头冲掉，而抬头恰恰是用户唯一想区分开的东西。
+      不搬 autostart —— 它背后是注册表 Run 键里一条带着 exe 完整路径的命令，
+          各机不同；更要紧的是：把 A 机的「关」搬给 B 机，等于偷偷关掉 B 机
+          的自启，用户只会看到「倒计时怎么不自己出来了」。
+      不搬 notify_state（寄信履历）—— 那是运行痕迹不是设置。搬过去会让新机器
+          以为「这几档已经寄过了」，真正的提醒反而不寄了。
+    """
+    snap = json.loads(json.dumps(cfg or {}))       # 深拷贝，绝不改调用方的对象
+    snap.pop("autostart", None)
+    nd = snap.get("notify")
+    if isinstance(nd, dict):
+        nd.pop("signature", None)
+    sec = secret if isinstance(secret, dict) else {}
+    bundle = {
+        "_说明": SHARED_NOTE,
+        "schema": SHARED_SCHEMA,
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "exported_at": _stamp(),
+        "config": snap,
+        "notify_secret": {"smtp_password": sec.get("smtp_password") or ""},
+    }
+    if selection is not None:
+        picked = set(k for k in shared_item_keys() if selection.get(k))
+        for spec in SHARED_ITEMS:
+            if spec["key"] in picked:
+                continue
+            for path in spec["drop"]:
+                _drop_shared_path(bundle, path)
+        # 写进文件里：用户拿记事本打开时能一眼看出「这份带了什么」，
+        # 不至于把只带颜色的那份当成全量，拷给机器才发现时刻没跟着走。
+        bundle["include"] = [it["label"] for it in SHARED_ITEMS
+                             if it["key"] in picked]
+    return bundle
+
+
+def parse_shared_bundle(blob):
+    """
+    把文件内容读成设置包。返回 (包, None) 或 (None, 失败原因)。
+
+    两种写法都认：
+      ① 完整形态（导出时写的）：{"config": {...}, "notify_secret": {...}}
+      ② 裸配置：整份就是配置本身 —— 有人会把老版本留下的
+         countdown_config.json 直接改名拿过来用，不该让他白跑一趟。
+    """
+    try:
+        data = json.loads(blob.decode("utf-8-sig"))
+    except UnicodeDecodeError:
+        return None, ("这个文件不是 UTF-8 文本，程序读不了。"
+                      "请用记事本打开、另存为时把编码选成 UTF-8。")
+    except ValueError as exc:
+        return None, "这个文件不是合法的设置文件（%s）" % exc
+    if not isinstance(data, dict):
+        return None, "这个文件的内容不是一个设置对象"
+    if isinstance(data.get("config"), dict):
+        return data, None
+    return {"config": data}, None
+
+
+def apply_shared_config(bundle):
+    """
+    把一份设置包写进注册表 —— 合并，文件里有的键一律以文件为准。
+
+    返回 (是否写入, 失败原因)。
+    """
+    if not isinstance(bundle, dict):
+        return False, "内容不是一个设置对象"
+    cfg_in = bundle.get("config")
+    if not isinstance(cfg_in, dict):
+        return False, "里面没有 config 这一段"
+
+    cfg_in = json.loads(json.dumps(cfg_in))
+    # 双保险：导出时不写抬头和自启，导入时也不认 —— 就算有人手工往文件里
+    # 加了这两项，也顶不掉本机的抬头、也不会关掉本机的自启。
+    cfg_in.pop("autostart", None)
+    nd = cfg_in.get("notify")
+    if isinstance(nd, dict):
+        nd.pop("signature", None)
+
+    cur = reg_store_read("config", {})
+    if not isinstance(cur, dict):
+        cur = {}
+    # deep_merge 只覆盖 files 里出现的键，所以本机抬头（不在文件里）原样留着。
+    # 本机从没设过抬头时这里也没有 signature，交给 load_config 按「首次运行」
+    # 补种计算机名 —— 正是多机同步想要的效果：设置一样，抬头各不相同。
+    merged = deep_merge(cur, cfg_in)
+    ok, err = reg_store_write("config", merged)
+    if not ok:
+        return False, "设置写不进注册表：%s" % err
+
+    sec_in = bundle.get("notify_secret")
+    if isinstance(sec_in, dict) and (sec_in.get("smtp_password") or "").strip():
+        cur_sec = reg_store_read("notify_secret", {"smtp_password": ""})
+        if not isinstance(cur_sec, dict):
+            cur_sec = {"smtp_password": ""}
+        cur_sec["smtp_password"] = sec_in["smtp_password"]
+        ok2, err2 = reg_store_write("notify_secret", cur_sec)
+        if not ok2:
+            return False, "授权码写不进注册表：%s" % err2
+    return True, ""
+
+
+def export_shared_config(path, cfg, secret, selection=None):
+    """
+    把当前设置写成一份共用设置文件。返回 (True, None) 或 (False, 失败原因)。
+
+    selection 见 build_shared_bundle；None = 全带。
+    """
+    bundle = build_shared_bundle(cfg, secret, selection)
+    text = json.dumps(bundle, ensure_ascii=False, indent=2) + "\n"
+    try:
+        # 带 BOM 写：用户多半会拿记事本打开看一眼，老记事本见到没 BOM 的
+        # UTF-8 会认成 ANSI，中文全糊。读回来时 utf-8-sig 会把 BOM 吃掉，对得上。
+        with open(path, "w", encoding="utf-8-sig", newline="\n") as fh:
+            fh.write(text)
+        return True, None
+    except OSError as exc:
+        return False, "%s" % exc
+
+
+def _note_shared_result(status, note):
+    """把最近一次共用设置的导入结果记下来，供设置面板显示（失败才另记一条）。"""
+    reg_store_write(SHARED_LAST_KEY, {"at": _stamp(), "status": status,
+                                      "note": note})
+    if status == "bad":
+        reg_store_write(SHARED_ERR_KEY, {"at": _stamp(), "note": note})
+
+
+def shared_last_result():
+    """最近一次导入的结果；从没导入过就返回空 dict。"""
+    data = reg_store_read(SHARED_LAST_KEY, {})
+    return data if isinstance(data, dict) else {}
+
+
+def apply_shared_file(path):
+    """
+    从指定的文件导入设置 —— 导入只有这一条路：设置面板里的「从文件导入…」。
+
+    曾经做过「启动时扫 exe 旁边、有就读走」，v1.6 起去掉了，原因见本文件
+    顶部共用设置那段说明：自动覆盖会把这台机器上独有的设置冲掉，而且出事时
+    用户根本不知道是文件干的。改成手动挑文件之后，什么时候导入、导哪一份，
+    都是用户当场看见、当场决定的。
+
+    **不删文件**：用户主动挑进来的那份很可能就是他留着的母本，替他删掉是添乱。
+    返回 (状态, 说明)。
+    """
+    try:
+        with open(path, "rb") as fh:
+            blob = fh.read()
+    except OSError as exc:
+        return "bad", "读不到这个文件：%s" % exc
+    bundle, err = parse_shared_bundle(blob)
+    if bundle is None:
+        _note_shared_result("bad", err)
+        return "bad", err
+    ok, err = apply_shared_config(bundle)
+    if not ok:
+        _note_shared_result("bad", err)
+        return "bad", err
+    _note_shared_result("applied", "已导入")
+    return "applied", "已导入"
+
+
+# --------------------------------------------------------------------------
 # 鸿雁传书 · 状态与凭据
 #
 # 三份数据各司其职，互不干扰（都在注册表键里，值名区分）：
@@ -644,32 +998,33 @@ def resolve_python():
 
 def ensure_mailer():
     """
-    把发信脚本落好，返回它的路径；落不了就返回 None。
+    找出发信脚本在哪，返回路径；找不到返回 None。**只找，不落盘。**
 
-    平时它就在程序旁边（源码 / 单文件 exe 都是），直接返回。
-    打包成「单个 exe」时它是被临时解出来的，下次运行就没了 ——
-    所以做成：程序旁边没有就照存一份。这样无论跑的是哪一种，
-    用户都能在文件夹里翻到这个脚本，自己核对它到底会寄什么。
+    源码模式：脚本就在程序旁边，直接返回。
+    打包成单个 exe：脚本被打进 exe 里（见 打包.py 的 --add-data），运行时
+    可以按 _MEIPASS 找到；这个路径只在本次进程存活期间有效，而发信进程
+    是「exe 自己兼任发信脚本」（见 mailer_target），它启动时会再解一份自己的，
+    所以这里不必、也不该把脚本复制出来。
+
+    2026-09-19 改：**取消了「程序旁边没有就照存一份」的旧行为**。
+    那个行为本意是让用户能翻到脚本自己核对内容，但代价是每寄一次信
+    （含点一次「试寄一封」）就往 exe 同目录丢一个 mailer.pyw ——
+    而用户明确要求「程序目录里永远只有 exe 一个文件」。
+    想核对脚本内容的话，发布包里本来就有一份。
 
     注意这里用的是「存脚本的那个目录」而不是 app_dir()：
     app_dir() 是模块加载时算好的常量（DATA_DIR 也一样），
     测试要让它变就得连整个模块重载 —— 那是测试在给代码让路。
     抽成函数之后，跑一次就是读一次，没有可缓存的状态。
     """
-    root = script_home()
-    here = os.path.join(root, MAILER_FILE)
+    here = os.path.join(script_home(), MAILER_FILE)
     if os.path.exists(here):
         return here
-    src = ""
     if is_frozen():
         src = os.path.join(getattr(sys, "_MEIPASS", "") or "", MAILER_FILE)
-    if not src or not os.path.exists(src):
-        return None
-    try:
-        shutil.copyfile(src, here)
-        return here
-    except OSError:
-        return src or None
+        if os.path.exists(src):
+            return src
+    return None
 
 
 def mailer_target():
@@ -786,11 +1141,17 @@ def _mailer_error_log(text):
     发信进程出岔子时的落盘日志。
 
     打包后的程序没有控制台，发信又是派生的隐藏进程 —— 一旦出错，
-    用户看到的现象只是「信没来」，没有任何线索。留一份日志在程序旁边，
+    用户看到的现象只是「信没来」，没有任何线索。留一份日志，
     排查时至少有东西可看。日志只保留最近一次，不会无限长大。
+
+    落在 %TEMP% 而不是程序旁边：程序目录要保持「只有 exe 一个文件」，
+    这份日志又只在出错时才有内容，放临时目录既不影响排查，
+    也不会在用户眼皮底下多出一个说不清的文件。
+    （崩溃日志 ac_crash.log 早就是这么做的，见 install_crash_hook。）
     """
     try:
-        path = os.path.join(DATA_DIR, "发信错误日志.txt")
+        import tempfile
+        path = os.path.join(tempfile.gettempdir(), "ac_mailer_error.txt")
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("时间: %s\n\n%s\n" % (_stamp(), text))
     except Exception:                   # noqa: BLE001
@@ -1615,6 +1976,77 @@ def _resolve_year(month, day, hour, minute, second, now, noisy):
     return None, "在接下来三年内找不到该日期，请检查月日"
 
 
+# 年份提示的判定范围：只有「像这几年的年份」才值得提醒一句。
+#
+# 为什么不是 1000~9999：四位数字只要 ≤ 2359 就同时是合法的「时时:分分」，
+# 所以 "1900"、"2100" 这些既像年份又像时间（19:00 / 21:00），
+# 而**时间才是这一段的默认含义**（年份按规定要写在最前面）。
+# 只有落在「现在前后这几年」里的数字，才真有可能是用户想写年份 ——
+# 那时候随口提一句，比事后让他自己发现倒计时差了一天强。
+YEAR_HINT_BACK = 1
+YEAR_HINT_FORWARD = 10
+
+
+def looks_like_recent_year(text, now=None):
+    """这个四位数是不是「像最近几年的年份」（只用于给一句提示，不参与解析）。"""
+    s = str(text or "").strip()
+    if len(s) != 4 or not s.isdigit():
+        return False
+    now = now or datetime.datetime.now()
+    y = int(s)
+    return now.year - YEAR_HINT_BACK <= y <= now.year + YEAR_HINT_FORWARD
+
+
+def _split_clock(text):
+    """
+    把揉在一起的时分秒拆成 [时, 分, 秒?]；拆不出来返回 None。
+
+        0330    -> [3, 30]       四位：时时 分分
+        033000  -> [3, 30, 0]    六位：时时 分分 秒秒
+        130     -> [1, 30]       奇数位：第一位单独当「时」，后面两两分组
+        13030   -> [1, 30, 30]
+
+    拆不出来（位数不在 3~6、或拆完越界）一律返回 None，让上层按原样去读、
+    该报错就报错 —— 宁可换来一句「时间需在 0 ~ 23 时」，也不要猜出一个
+    看着合理的错时间。这和「13.1 不能猜成 2013 年」是同一条规矩。
+    """
+    s = str(text or "").strip()
+    if not s.isdigit() or not 3 <= len(s) <= 6:
+        return None
+    if len(s) % 2:                       # 奇数位：第一位单独当「时」
+        groups = [s[0]] + [s[i:i + 2] for i in range(1, len(s), 2)]
+    else:
+        groups = [s[i:i + 2] for i in range(0, len(s), 2)]
+    parts = [int(g) for g in groups]
+    hh = parts[0]
+    mm = parts[1] if len(parts) > 1 else 0
+    ss = parts[2] if len(parts) > 2 else 0
+    if not (0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59):
+        return None
+    return parts
+
+
+def _expand_compact_time(toks):
+    """
+    摊开「时」那一段（下标 2）里揉着的写法，返回新的字符串列表。
+
+        ["10", "1", "0330"]          -> ["10", "1", "03", "30"]
+        ["10", "1", "033000"]        -> ["10", "1", "03", "30", "00"]
+        ["2026", "10", "1", "1130"]  -> ["2026", "10", "1", "11", "30"]
+
+    只动这一段：前两段是月、日；四位数的年份也压根不在这个位置上
+    （"2026.10.1" 的第一段才是年份）。月、日那两段绝不动 ——
+    否则 "10 1 0330" 里的 "10" 会被当成 1 时 0 分，整条读法全乱。
+    """
+    out = list(toks)
+    if len(out) <= 2:
+        return out
+    parts = _split_clock(out[2])
+    if parts:
+        out[2:3] = ["%02d" % v for v in parts]
+    return out
+
+
 def parse_target(text, now=None):
     """
     解析目标时刻 —— 只认数字，数字之间填什么当分隔都行。
@@ -1622,6 +2054,9 @@ def parse_target(text, now=None):
         "10.1.11.30"        10月1日 11:30
         "10 1 2  32"        同上（空格、点半角全角、逗号斜杠破折号一概当分隔）
         "10.1/2，32"        同上
+        "10 1 0330"         10月1日 03:30（时分揉在一个数字里也认）
+        "10.1.1130"         10月1日 11:30
+        "10 1 033000"       10月1日 03:30:00
         "2026.10.1.11.30"   显式指定年份
         "26.10.1"           年份写两位也行
 
@@ -1673,8 +2108,8 @@ def parse_target(text, now=None):
 
     readings = []
     if len(nums[0]) == 4:
-        readings.append(("year4", vals[0], vals[1:]))
-    readings.append(("plain", None, vals))
+        readings.append(("year4", vals[0], nums[1:]))
+    readings.append(("plain", None, nums))
     if len(nums[0]) == 2:
         y2 = 2000 + vals[0]
         # 两位年份只在「离当年足够近」时才算数。
@@ -1689,11 +2124,16 @@ def parse_target(text, now=None):
         # 挡掉之后，"13.1" 会落到错误提示「月份需在 1~12 之间」，
         # 比一个看着合理的错误日期好得多。
         if now.year - 8 <= y2 <= now.year + 8:
-            readings.append(("year2", y2, vals[1:]))
+            readings.append(("year2", y2, nums[1:]))
 
     for kind, year, rest in readings:
         if not rest:
             continue
+        # 时间那一段可能被揉在一个数字里（"10 1 0330" 的第三段）。
+        # 摊开放在这里做，是因为「哪一段是时」要看了读法才知道：
+        # plain 读法的月日在 rest[0]、rest[1]，年份读法同样如此 ——
+        # 两种情况下「时」都在 rest[2]，所以摊开的位置一致。
+        rest = [int(t) for t in _expand_compact_time(rest)]
         mo, dy = rest[0], (rest[1] if len(rest) > 1 else 1)
         hr = rest[2] if len(rest) > 2 else 0
         mi = rest[3] if len(rest) > 3 else 0
@@ -1805,7 +2245,8 @@ class CountdownApp:
         self._zero_key = None
         self._zero_size = 100
 
-        self.gear_hover = False
+        self._ctl_hover = ""            # 右上角三个小按钮里，鼠标正压着哪一个
+        self._ctl_pos = {}              # 绘制时算好的按钮坐标，命中判定读它
         self._settings = None
 
         # 自动检查更新的状态全部落在注册表：限频时间戳、上次看到的线上版本。
@@ -1956,6 +2397,11 @@ class CountdownApp:
         c.bind("<Button-3>", self._popup_menu)
         c.bind("<Configure>", self._on_configure)
         self.root.bind("<Escape>", lambda e: self.close_settings())
+        # 从任务栏恢复时要把系统边框收回去 —— 见 minimize_app / _on_root_map。
+        # <Map> 是「窗口重新出现」，<FocusIn> 是兜底：个别情况下任务栏恢复
+        # 只触发了焦点变化。两个都挂上，函数内部会先判一次状态，开销可忽略。
+        self.root.bind("<Map>", self._on_root_map)
+        self.root.bind("<FocusIn>", self._on_root_map)
 
     def _build_menu(self):
         pal = self.cfg["palette"]
@@ -2011,7 +2457,10 @@ class CountdownApp:
         """
         pal = self.cfg["palette"]
         heavy, light = pal["ink"], pal["paper"]
-        ratio = {"strong": 0.0, "soft": 0.28, "faint": 0.52}.get(level, 0.28)
+        # "title" 比 soft 更实一点：顶上那行「目標 · 某月某日」要说清楚在倒数
+        # 哪一天，太淡了在小窗口上就跟没有一样。
+        ratio = {"strong": 0.0, "title": 0.14, "soft": 0.28,
+                 "faint": 0.52}.get(level, 0.28)
         anchor = heavy if not self._is_dark_bg() else light
         other = light if anchor == heavy else heavy
         return mix(anchor, other, ratio)
@@ -2043,7 +2492,7 @@ class CountdownApp:
         self.canvas.delete("all")
         self._draw_paper(W, H, bg)
         self._draw_frame(W, H)
-        self._draw_gear(W, H)
+        self._draw_controls(W, H)
         self._draw_seal(W, H)
         self._draw_head(W, H)
         self.redraw_dynamic()
@@ -2082,16 +2531,24 @@ class CountdownApp:
                           fill=pal["border_soft"], width=1)
 
     def _draw_head(self, W, H):
-        """顶部古风标题：目标时刻 + 当前规则标签。"""
+        """顶部目标时刻（写清楚在倒数什么）+ 左下角当前规则名。"""
         pal = self.cfg["palette"]
         m = max(7, int(min(W, H) * 0.030))
-        size = max(9, min(16, int(H * 0.062)))
+        size = self._title_size()
         self.f_title.configure(size=size)
 
         title = pretty_target(self.target) if self.target else "尚未设定目标时刻"
-        self.canvas.create_text(W / 2, m + size + 8, text=title,
+        # 光一个日期顶在上面，不写清楚它是「目标时刻」，会有人当成今天的日期
+        # —— 尤其是「12月25日」这种看着像节日的日子。所以前缀两个字不能省。
+        text = ("目標 · " + title) if self.target else title
+        # 窄窗口下这行可能顶出两边，逐号往回收到放得下为止
+        limit = max(60, W - 2 * m - 24)
+        while size > 9 and self.f_title.measure(text) > limit:
+            size -= 1
+            self.f_title.configure(size=size)
+        self.canvas.create_text(W / 2, m + size + 6, text=text,
                                 font=self.f_title,
-                                fill=self._ink_tone("soft"))
+                                fill=self._ink_tone("title"))
 
         # 左下角：当前配色规则名
         label = (self.theme or {}).get("label") or ""
@@ -2103,29 +2560,64 @@ class CountdownApp:
                                     font=self.f_hint,
                                     fill=self._ink_tone("faint"))
 
-    def _draw_gear(self, W, H):
+    def _draw_controls(self, W, H):
         """
-        右上角「設」字入口。自动检查发现新版本时，旁边点一颗朱砂小点。
+        右上角三个入口：「設」设置、「—」最小化到任务栏、「✕」退出。
+
+        自动检查发现新版本时，在「設」旁边点一颗朱砂小点。
+
+        为什么还是要自绘而不是用 tk.Button：这个窗口是无边框的
+        （overrideredirect），没有系统标题栏可挂按钮；而且整套配色会随
+        用户改，自绘才能跟着变。
 
         整组图元统一挂 "gear" 标签、动手前先删干净：鼠标进出这个区域会被
-        反复重画（见 _mouse_move），不先删就会一层层叠上去。
+        反复重画（见 _on_hover），不先删就会一层层叠上去。
         """
         pal = self.cfg["palette"]
         m = max(7, int(min(W, H) * 0.030))
         self.f_gear.configure(size=max(10, min(15, int(H * 0.058))))
-        self._gear_pos = (W - m - 20, m + 19)
-        color = pal["seal"] if self.gear_hover else self._ink_tone("faint")
+        cy = m + 19
+        # 间距跟着窗口尺寸走：窗口缩到 300 宽时挤不下三个 24px 的间隔
+        step = max(CTRL_STEP_MIN, int(min(W, H) * 0.085))
+        # 从右往左排：关闭在最外侧、最小化其次、设置在最里面。
+        # 「設」留在原来习惯的位置附近，老用户不会找不到。
+        self._ctl_pos = {
+            "close": (W - m - 18, cy),
+            "min": (W - m - 18 - step, cy),
+            "gear": (W - m - 18 - step * 2, cy),
+        }
         self.canvas.delete("gear")
-        self.canvas.create_text(*self._gear_pos, text="設", font=self.f_gear,
-                                fill=color, tags="gear")
+        faint = self._ink_tone("faint")
+        for name, glyph in (("gear", "設"), ("min", "—"), ("close", "✕")):
+            x, y = self._ctl_pos[name]
+            self.canvas.create_text(
+                x, y, text=glyph, font=self.f_gear, tags="gear",
+                fill=pal["seal"] if self._ctl_hover == name else faint)
         if self.new_version:
             # 只点一颗小点：不写字、不弹窗。想升级的人自然会去点「設」，
             # 不想升级就一直是一颗点，不打扰。
-            gx, gy = self._gear_pos
+            gx, gy = self._ctl_pos["gear"]
             r = max(2.5, min(W, H) * 0.011)
-            cx, cy = gx + r * 3.0, gy - r * 3.0
-            self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+            cx, cy2 = gx + r * 3.0, gy - r * 3.0
+            self.canvas.create_oval(cx - r, cy2 - r, cx + r, cy2 + r,
                                     fill=pal["seal"], outline="", tags="gear")
+
+    def _ctl_at(self, x, y):
+        """
+        落在哪个右上角按钮上；没踩着返回 ""。
+
+        取「最近的那一枚」而不是字典里第一个碰上的：三个按钮里最外侧是「✕」，
+        万一间距被改小到命中框搭界，先到先得会让「关闭」抢走本该给「最小化」的点。
+        取最近至少保证点谁算谁。
+        """
+        best, best_d = "", None
+        for name, (bx, by) in (self._ctl_pos or {}).items():
+            dx, dy = x - bx, y - by
+            if abs(dx) <= CTRL_HIT and abs(dy) <= CTRL_HIT:
+                d = dx * dx + dy * dy
+                if best_d is None or d < best_d:
+                    best, best_d = name, d
+        return best
 
     def _draw_seal(self, W, H):
         """右下角朱砂印。"""
@@ -2153,11 +2645,31 @@ class CountdownApp:
         else:
             self._draw_digits()
 
+    def _title_size(self):
+        """
+        顶部「目標 · 某月某日」那行字的字号。
+
+        比原先大一号（原来上限 16、下限 9）：窗口拉到最小时那行只有 9px，
+        用户根本看不清倒计时到哪一天，而这行恰恰是「这个挂件在为什么事
+        倒数」的唯一说明。小窗口下尤其不该缩到看不清。
+        """
+        return max(11, min(22, int(self.H * 0.085)))
+
+    def _head_bottom(self, m=None):
+        """标题区下沿：数字从这里往下排。与 _draw_head 用同一套算法。"""
+        m = max(7, int(min(self.W, self.H) * 0.030)) if m is None else m
+        return int(m + self._title_size() * 1.6 + 10)
+
     def _region(self):
-        """数字可用区域 (left, top, right, bottom)。"""
+        """
+        数字可用区域 (left, top, right, bottom)。
+
+        四周留白压得比较紧（左右各 m+16、底部 m+16，原来是 30 / 26）：
+        这个挂件的全部意义就是那一串数字，留白多一寸字就白小一号。
+        用户把窗口拉到最小时抱怨的正是「字太小」，所以能给的空间都给数字。
+        """
         m = max(7, int(min(self.W, self.H) * 0.030))
-        head = m + max(9, min(16, int(self.H * 0.062))) * 2 + 14
-        return (m + 30, head, self.W - m - 30, self.H - m - 26)
+        return (m + 16, self._head_bottom(m), self.W - m - 16, self.H - m - 16)
 
     # ---- 字号拟合：比例估算 + 缓存，避免逐号试错 ----
 
@@ -2169,6 +2681,16 @@ class CountdownApp:
         unit_size = max(8, int(size * 0.36))
         if int(self.f_num.cget("size")) != size or int(self.f_unit.cget("size")) != unit_size:
             self._apply_num_size(size)
+
+    def _num_spacing(self, size):
+        """
+        数字与单位之间的间隙、以及两组之间的间隙。
+
+        比例从 0.26 / 0.42 压到 0.18 / 0.30：四组数字之间的空档原本吃掉近
+        三成宽度，收窄之后同一个窗口能放大约一成的字号。这正是「窗口拉小
+        时字太小」最直接的补偿，而且不动任何布局结构。
+        """
+        return max(4, int(size * 0.18)), max(7, int(size * 0.30))
 
     def _block_width(self, pairs, size, gap, grp):
         total = 0
@@ -2185,26 +2707,26 @@ class CountdownApp:
         """
         probe = 100
         self._apply_num_size(probe)
-        w0 = self._block_width(pairs, probe, max(5, int(probe * 0.26)),
-                               max(9, int(probe * 0.42)))
+        w0 = self._block_width(pairs, probe, *self._num_spacing(probe))
         h0 = max(1, self.f_num.metrics("linespace"))
         if w0 <= 0:
             return probe
 
-        size = max(9, min(400, int(probe * min(avail_w / w0, avail_h / h0))))
+        size = max(MIN_NUM_SIZE, min(400,
+                                     int(probe * min(avail_w / w0, avail_h / h0))))
         for _ in range(5):
             self._apply_num_size(size)
-            gap = max(5, int(size * 0.26))
-            grp = max(9, int(size * 0.42))
+            gap, grp = self._num_spacing(size)
             w = self._block_width(pairs, size, gap, grp)
             h = self.f_num.metrics("linespace")
             if w <= avail_w and h <= avail_h:
                 break
-            nxt = max(9, int(size * min(avail_w / max(1, w), avail_h / max(1, h)) * 0.97))
+            nxt = max(MIN_NUM_SIZE,
+                      int(size * min(avail_w / max(1, w), avail_h / max(1, h)) * 0.97))
             if nxt >= size:
                 nxt = size - 1
-            if nxt < 9:
-                size = 9
+            if nxt < MIN_NUM_SIZE:
+                size = MIN_NUM_SIZE
                 break
             size = nxt
 
@@ -2261,8 +2783,7 @@ class CountdownApp:
         size = self._digits_size
         self._ensure_num_size(size)
 
-        gap = max(5, int(size * 0.26))
-        grp = max(9, int(size * 0.42))
+        gap, grp = self._num_spacing(size)
         total = self._block_width(pairs, size, gap, grp)
 
         fg = (self.theme or {}).get("fg") or pal["default_fg"]
@@ -2416,7 +2937,7 @@ class CountdownApp:
             return
         self.new_version = known
         try:
-            self._draw_gear(self.W, self.H)
+            self._draw_controls(self.W, self.H)
         except Exception:                    # noqa: BLE001
             pass
 
@@ -2502,13 +3023,12 @@ class CountdownApp:
     def _on_hover(self, event):
         if self._dragging:
             return
-        on_gear = self._gear_pos and \
-            abs(event.x - self._gear_pos[0]) < 16 and abs(event.y - self._gear_pos[1]) < 16
-        if on_gear != self.gear_hover:
-            self.gear_hover = on_gear
-            self._draw_gear(self.W, self.H)
+        name = self._ctl_at(event.x, event.y)
+        if name != self._ctl_hover:
+            self._ctl_hover = name
+            self._draw_controls(self.W, self.H)
 
-        if on_gear:
+        if name:
             self.canvas.configure(cursor="hand2")
             return
 
@@ -2520,9 +3040,15 @@ class CountdownApp:
         self.canvas.configure(cursor=cursor)
 
     def _on_press(self, event):
-        if self._gear_pos and abs(event.x - self._gear_pos[0]) < 16 \
-                and abs(event.y - self._gear_pos[1]) < 16:
+        name = self._ctl_at(event.x, event.y)
+        if name == "gear":
             self.open_settings()
+            return
+        if name == "min":
+            self.minimize_app()
+            return
+        if name == "close":
+            self.quit_app()
             return
 
         mode = self.hit_test(event.x, event.y)
@@ -2585,13 +3111,82 @@ class CountdownApp:
         self.layout()
         self._remember_geometry()
 
+    def resize_to(self, w, h):
+        """
+        按给定的宽高改窗口尺寸（设置面板里那个「应用」走这里）。
+        返回错误文本；空串 = 改好了。
+
+        为什么要有这个口子：窗口大小一直是靠拖边缘调的，可拖出来是多大
+        没有任何地方写着 —— 想让几台机器调成一样、或者照着某个尺寸复原，
+        只能凭手感来回试。给一个能看见、能填准的地方，比再拖十次有用。
+        """
+        if self.cfg.get("locked"):
+            return "窗口尺寸已锁定：先取消「锁定窗口尺寸」再改"
+        try:
+            w, h = int(float(w)), int(float(h))
+        except (TypeError, ValueError):
+            return "尺寸要填数字"
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        # 上下都夹住：太小会看不清字（MIN_W/MIN_H），太大就顶出屏幕了
+        w = max(MIN_W, min(w, sw))
+        h = max(MIN_H, min(h, sh))
+        x, y, _ = self.clamp_position(self.x, self.y, w, h)
+        self._apply_geometry(x, y, w, h)
+        self.layout()
+        self._remember_geometry()
+        return ""
+
     def reset_position(self):
         """把窗口挪回默认位置——万一它跑到屏幕外，靠这个救回来。"""
         x, y = self.default_position()
         self._apply_geometry(x, y, self.w, self.h)
         self.root.deiconify()
         self.root.lift()
+        self._restore_chrome()
         self._remember_geometry()
+
+    def minimize_app(self):
+        """
+        最小化到任务栏（右上角「—」）。
+
+        无边框窗口（overrideredirect）直接 iconify 在 Windows 上会
+        「窗口不见了、任务栏里也没有」—— 等于把程序弄丢，用户只好像
+        重启电脑那样找它。所以先临时把系统边框交还回去，
+        任务栏才肯接管它；从任务栏恢复时再由 _restore_chrome 收回边框。
+
+        恢复这条链路有两道保险：<Map> 事件，以及用户重新双击 exe 时的
+        唤醒信号（_consume_wake 会走到 reset_position，那里也会收回边框）。
+        """
+        try:
+            self.root.overrideredirect(False)
+            self.root.iconify()
+        except tk.TclError:
+            pass
+
+    def _restore_chrome(self):
+        """
+        把系统边框收回去、尺寸位置摆回原位。
+
+        只在「边框确实被交还给了系统」时才动手，所以重复调用是安全的。
+        """
+        try:
+            if self.root.state() != "normal" or chrome_hidden(self.root):
+                return
+            self.root.overrideredirect(True)
+            self.root.attributes("-topmost", bool(self.cfg.get("always_on_top", True)))
+            self.root.update_idletasks()
+            # 交还边框时系统会按标题栏高度改窗口矩形，收回来之后要摆回原位
+            set_geometry(self.root, self.w, self.h, self.x, self.y)
+            self.layout()
+        except tk.TclError:
+            pass
+
+    def _on_root_map(self, event=None):
+        """窗口从任务栏恢复（或重新拿到焦点）时，把自绘边框还原。"""
+        if event is not None and getattr(event, "widget", None) is not self.root:
+            return
+        self._restore_chrome()
 
     def _consume_wake(self):
         """另一个实例被启动了：用户想看见窗口，那就把自己挪回可见处。"""
@@ -3161,6 +3756,63 @@ class CountdownApp:
         self.layout()
         return None
 
+    def import_shared_from(self, path):
+        """
+        面板里「从文件导入」的落地动作 —— 导入只有这一条路。
+        返回失败说明；成功返回 None。
+
+        两点要紧：**不删文件**（那是用户挑出来的，很可能是他留着的那份
+        母本），以及**当场把界面刷成新设置** —— 用户不会为了看一眼效果
+        去重启程序。
+        """
+        status, note = apply_shared_file(path)
+        if status != "applied":
+            return note
+        try:
+            self.reload_from_store()
+        except Exception as exc:                      # noqa: BLE001
+            return "设置已经写入，但界面刷新时出错：%s" % exc
+        return None
+
+    def reload_from_store(self):
+        """
+        从注册表重新读一遍设置，并把窗口按新设置刷新（不重启程序）。
+
+        和 factory_reset 的刷新段是同一套路子，但不清数据、不挪窗口位置 ——
+        换的是配色、目标时刻、颜色规则、邮箱设置这些「设置类」的东西。
+        """
+        self.cfg = load_config()
+        self.secret = load_notify_secret()
+        self.notify_state = load_notify_state()
+
+        self.target, self.parse_err = parse_target(self.cfg.get("target"))
+        self.remaining = ((self.target - datetime.datetime.now()).total_seconds()
+                          if self.target else None)
+        self.zero_mode = bool(self.remaining is not None and self.remaining <= 0)
+        self._last_text = None
+        self.theme = None
+        self.blink = False
+        self._last_notify_check = 0.0      # 让下一轮巡检立刻用新设置重算
+
+        pal = self.cfg["palette"]
+        self.root.configure(bg=pal["ink"])
+        self.canvas.configure(bg=pal["paper"])
+        self.root.attributes("-topmost", bool(self.cfg.get("always_on_top", True)))
+        # 尺寸也按新配置来（窗口位置保持不变：导入进来的坐标属于别的机器，
+        # 硬套到本机反而会把窗口甩到屏幕外）
+        self.w = min(max(MIN_W, int((self.cfg.get("window") or {}).get("w") or 620)),
+                     max(MIN_W, self.root.winfo_screenwidth()))
+        self.h = min(max(MIN_H, int((self.cfg.get("window") or {}).get("h") or 300)),
+                     max(MIN_H, self.root.winfo_screenheight()))
+        self.root.deiconify()
+        self.root.lift()
+        self._restore_chrome()
+        set_geometry(self.root, self.w, self.h, self.x, self.y)
+        self.W, self.H = self.w, self.h
+
+        self._refresh_menu()
+        self.layout()
+
     def run(self):
         self.root.mainloop()
 
@@ -3169,10 +3821,198 @@ class CountdownApp:
 # 设置面板
 # --------------------------------------------------------------------------
 
+class ExportPicker:
+    """
+    导出共用设置时那个「挑哪几项」的小窗。
+
+    为什么非得有它：用户要同步的是十几台机器，绝大多数设置想配成一样，
+    偏偏每台机器的目标时刻各不相同（各有各要倒计的事）。不挑的话，一次
+    同步就把所有机器的时刻冲成同一个 —— 恰是他最不能接受的事。
+    所以默认把「目标时刻」留成不勾，其余全勾；想连时刻一起发，自己点上。
+
+    勾选结果会记住（见 load_shared_selection）：一次配十台机器，每次要的
+    几乎总是同一套，不该让他每条重新勾一遍。
+    """
+
+    W = 440
+
+    def __init__(self, app, on_pick):
+        self.app = app
+        self.on_pick = on_pick
+        pal = app.cfg["palette"]
+        self.pal = pal
+        self.sel = load_shared_selection()
+        self.rows = []              # [(key, 那个方框 Label)]
+        self._pt = None             # 拖标题栏时的按下点
+
+        self.win = tk.Toplevel(app.root)
+        self.win.overrideredirect(True)
+        self.win.configure(bg=pal["border"])
+        self.win.attributes("-topmost", True)
+        self.body = tk.Frame(self.win, bg=pal["paper"])
+        self.body.pack(fill="both", expand=True, padx=3, pady=3)
+
+        self._build_header()
+        for spec in SHARED_ITEMS:
+            self._row(spec)
+        self._build_footer()
+
+        self.win.update_idletasks()
+        self._center()
+        self.win.bind("<Escape>", lambda e: self.close())
+        try:
+            self.win.grab_set()     # 挑完再回设置面板，避免两层窗口打架
+        except tk.TclError:
+            pass
+
+    # ---- 结构 ----
+
+    def _build_header(self):
+        pal, app = self.pal, self.app
+        head = tk.Frame(self.body, bg=pal["ink"], height=34)
+        head.pack(fill="x")
+        head.pack_propagate(False)
+        tk.Label(head, text="　导出哪些设置", bg=pal["ink"], fg=pal["paper"],
+                 font=(app.fam_cn, 11, "bold")).pack(side="left", padx=10)
+        close = tk.Label(head, text="✕", bg=pal["ink"], fg=pal["border_soft"],
+                         font=("Segoe UI", 11), cursor="hand2", padx=12)
+        close.pack(side="right", fill="y")
+        close.bind("<Button-1>", lambda e: self.close())
+        close.bind("<Enter>",
+                   lambda e: close.configure(bg=pal["seal"], fg="#FFF8EC"))
+        close.bind("<Leave>",
+                   lambda e: close.configure(bg=pal["ink"], fg=pal["border_soft"]))
+        head.bind("<Button-1>", self._drag_start)
+        head.bind("<B1-Motion>", self._drag_move)
+
+        tk.Label(self.body,
+                 text="　勾上的才会写进文件。没勾的那一项，对方机器上原来\n"
+                      "　的设置会原样留着 —— 不会被这台的样子覆盖掉。",
+                 bg=pal["paper"], fg=pal["border"], font=(app.fam_cn, 9),
+                 anchor="w", justify="left").pack(fill="x", padx=16, pady=(8, 4))
+
+    def _row(self, spec):
+        pal, app, key = self.pal, self.app, spec["key"]
+        row = tk.Frame(self.body, bg=pal["paper"])
+        row.pack(fill="x", padx=16, pady=(4, 0))
+
+        box = tk.Label(row, text="", bg=pal["paper"], font=(app.fam_cn, 12),
+                       cursor="hand2", width=2)
+        box.pack(side="left", anchor="n")
+
+        txt = tk.Frame(row, bg=pal["paper"])
+        txt.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        tk.Label(txt, text=spec["label"], bg=pal["paper"], fg=pal["ink"],
+                 font=(app.fam_cn, 10), anchor="w").pack(fill="x")
+        tk.Label(txt, text=spec["hint"], bg=pal["paper"], fg=pal["border"],
+                 font=(app.fam_cn, 8), anchor="w", justify="left").pack(fill="x")
+
+        # 整行和方框都能点 —— 字小、行窄，只让那个小方框能点太难点中
+        for w in (row, box, txt):
+            w.bind("<Button-1>", lambda e, k=key: self._toggle(k))
+        self.rows.append((key, box))
+        self._paint(key)
+
+    def _build_footer(self):
+        pal, app = self.pal, self.app
+        tk.Frame(self.body, bg=pal["border_soft"], height=1).pack(
+            fill="x", padx=16, pady=(12, 0))
+        bar = tk.Frame(self.body, bg=pal["paper"])
+        bar.pack(fill="x", padx=16, pady=10)
+
+        for text, act in (("全选", self._pick_all), ("全不选", self._pick_none)):
+            b = tk.Label(bar, text=text, bg=pal["paper"], fg=pal["ink_soft"],
+                         font=(app.fam_cn, 9), cursor="hand2")
+            b.pack(side="left", padx=(0, 12))
+            b.bind("<Button-1>", lambda e, f=act: f())
+            b.bind("<Enter>", lambda e, w=b: w.configure(fg=pal["seal"]))
+            b.bind("<Leave>", lambda e, w=b: w.configure(fg=pal["ink_soft"]))
+
+        go = tk.Label(bar, text="确 定", bg=pal["paper"], fg=pal["ink"],
+                      font=(app.fam_cn, 11, "bold"), cursor="hand2",
+                      padx=14, pady=4, relief="solid", bd=1)
+        go.pack(side="right")
+        go.bind("<Button-1>", lambda e: self._confirm())
+        cancel = tk.Label(bar, text="取消", bg=pal["paper"], fg=pal["ink_soft"],
+                          font=(app.fam_cn, 10), cursor="hand2", padx=10, pady=4)
+        cancel.pack(side="right", padx=(0, 8))
+        cancel.bind("<Button-1>", lambda e: self.close())
+
+    # ---- 行为 ----
+
+    def _paint(self, key):
+        """按当前勾选把那个方框画出来（☑ 实心勾 / ☐ 空心）。"""
+        for k, box in self.rows:
+            if k != key:
+                continue
+            on = bool(self.sel.get(key))
+            box.configure(text="☑" if on else "☐",
+                          fg=self.pal["seal"] if on else self.pal["border"])
+
+    def _toggle(self, key):
+        self.sel[key] = not self.sel.get(key)
+        self._paint(key)
+
+    def _pick_all(self):
+        for key in shared_item_keys():
+            self.sel[key] = True
+            self._paint(key)
+
+    def _pick_none(self):
+        for key in shared_item_keys():
+            self.sel[key] = False
+            self._paint(key)
+
+    def _confirm(self):
+        picked = [k for k in shared_item_keys() if self.sel.get(k)]
+        if not picked:
+            # 空文件不是「什么都不改」，它会让对方以为导入成功了 —— 更糟
+            messagebox.showwarning("还没挑东西",
+                                   "至少勾一项再导出。\n\n"
+                                   "一项都不带的文件拷到别的机器上什么也不会改，"
+                                   "但那边会显示「导入成功」，反而更难发现问题。")
+            return
+        save_shared_selection(self.sel)
+        cb, sel = self.on_pick, dict(self.sel)
+        self.close()
+        if cb:
+            cb(sel)                  # 关掉自己再回调：后面的保存对话框才不会挂在这扇窗上
+
+    def _drag_start(self, event):
+        self._pt = (event.x_root - self.win.winfo_x(),
+                    event.y_root - self.win.winfo_y())
+
+    def _drag_move(self, event):
+        if not self._pt:
+            return
+        # 拖到左屏 / 上屏时坐标是负的，必须走 set_window_pos，否则窗口会「拖不动」
+        set_window_pos(self.win, event.x_root - self._pt[0],
+                       event.y_root - self._pt[1])
+
+    def _center(self):
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        w = max(self.W, self.win.winfo_reqwidth())
+        h = self.win.winfo_reqheight()
+        top = max(8, min((sh - h) // 2 - 40, sh - h - 16))
+        set_geometry(self.win, w, h, (sw - w) // 2, top)
+
+    def close(self):
+        try:
+            self.win.grab_release()
+        except (tk.TclError, AttributeError):
+            pass
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+
+
 class SettingsPanel:
     """古风配色设置面板（无系统边框，自绘标题栏）。"""
 
-    W = 470
+    W = 470                 # 单列宽（屏幕不够宽时的兜底）
+    WIDE = 900              # 两列宽（正常情况走这个）
 
     def __init__(self, app):
         self.app = app
@@ -3182,8 +4022,13 @@ class SettingsPanel:
         self.notify_rows = []   # [(days_var, on_var, row)] —— 传书提醒档位
         self._color_popup = None
         self._color_popup_for = None
-        self._scroll_y = None   # 滚轮挪窗口的位移基准；None = 下次以实际位置为准
+        self._picker = None     # 「导出哪些设置」那扇小窗；面板关掉时一并带走
         self._updating = False  # 正在检查/下载更新，防止重复点按钮
+        # 两列排版：内容越加越长，单列在 720p 高的机器上会顶出屏幕，
+        # 下半截得靠挪窗口才看得见。分成两列高度差不多减半 —— 宽度富余得很，
+        # 高度才是稀缺的。（窄屏兜底：屏幕不够宽就退回单列宽。）
+        self.W = min(SettingsPanel.WIDE,
+                     max(SettingsPanel.W, app.root.winfo_screenwidth() - 60))
 
         self.win = tk.Toplevel(app.root)
         self.win.overrideredirect(True)
@@ -3194,18 +4039,94 @@ class SettingsPanel:
         self.body.pack(fill="both", expand=True, padx=3, pady=3)
 
         self._build_header()
-        self._build_form()
-        self._build_notify()
+        self._build_columns()
         self._build_footer()
+        self._fit_height()
 
-        self.win.update_idletasks()
-        self._center()
         self.win.bind("<Escape>", lambda e: self.close())
-        # 面板比屏幕高时还能靠滚轮上下挪（见 _wheel_scroll）
-        self.win.bind("<MouseWheel>", self._wheel_scroll)
+        # 无边框窗口没有系统滚动条，滚轮得自己接（见 _on_wheel）
+        self.win.bind_all("<MouseWheel>", self._on_wheel)
         self.entry.focus_set()
 
     # ---- 结构 ----
+
+    def _build_columns(self):
+        """
+        内容分左右两列，装进一层可上下滚的 Canvas。
+
+        左列：倒计到什么时候 / 颜色怎么变 / 怎么同步给别的机器
+        右列：窗口怎么摆 / 要不要寄信
+        这么分不是照重要性，是照「一块内容有多高」配平的 —— 传书那一块自带
+        好几行，跟它同列的就得矮一点；否则一列顶到底、另一列空半截，
+        面板高度由高的那一列说了算，配平了才真的省下高度。
+        """
+        pal = self.pal
+        self.canvas = tk.Canvas(self.body, bg=pal["paper"], highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        inner = tk.Frame(self.canvas, bg=pal["paper"])
+        self._inner_win = self.canvas.create_window((0, 0), window=inner,
+                                                    anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: self.canvas.configure(
+                       scrollregion=self.canvas.bbox("all")))
+        # canvas 变宽变窄时把内容区拉齐，两列才不会挤在左边一小条里
+        self.canvas.bind("<Configure>", self._on_canvas_resize)
+        self.inner = inner
+
+        cols = tk.Frame(inner, bg=pal["paper"])
+        cols.pack(fill="both", expand=True)
+        # 用 grid 而不是 pack：pack(expand=True) 只能均分「多出来的」空间，
+        # 两列内容本身宽度不一样时（左列那几个长复选框），结果是一宽一窄。
+        # uniform 加 weight 才是真·等宽 —— 取两列里较宽的那个为准。
+        cols.grid_columnconfigure(0, weight=1, uniform="col")
+        cols.grid_columnconfigure(1, weight=1, uniform="col")
+        cols.grid_rowconfigure(0, weight=1)
+        self.col_l = tk.Frame(cols, bg=pal["paper"])
+        self.col_l.grid(row=0, column=0, sticky="nsew", padx=(10, 4))
+        self.col_r = tk.Frame(cols, bg=pal["paper"])
+        self.col_r.grid(row=0, column=1, sticky="nsew", padx=(4, 10))
+
+        self._build_target(self.col_l)
+        self._build_thresholds(self.col_l)
+        self._build_shared(self.col_l)
+        self._build_window(self.col_r)
+        self._build_notify(self.col_r)
+
+    def _on_canvas_resize(self, event):
+        try:
+            self.canvas.itemconfigure(self._inner_win, width=event.width)
+            # 顺手把滚动范围刷一遍：inner 的尺寸未必变（比如只是 canvas 变矮了），
+            # 光靠 inner 的 <Configure> 会漏掉这种情况，于是滚轮「完全没反应」。
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        except tk.TclError:
+            pass
+
+    def _fit_height(self):
+        """面板高度压到屏幕放得下为止；实在放不下的部分交给滚轮。"""
+        self.win.update_idletasks()
+        req_h = self.inner.winfo_reqheight()
+        req_w = self.inner.winfo_reqwidth()
+        # 150 = 标题栏 38 + 页脚约 76 + 外框 6，再加一点余量。
+        # 只减 110 的话，面板总高会正好顶到屏幕边 —— 底部按钮被任务栏压住。
+        room = max(260, self.win.winfo_screenheight() - 150)
+        # 宽度跟着内容走（两列等宽后可能比预设的 W 更宽一点），
+        # 写死 W-6 会把较宽那一列的内容裁掉一截。
+        self.canvas.configure(height=min(req_h, room),
+                              width=max(self.W - 6, req_w))
+        self.win.update_idletasks()
+        # 显式设一次滚动范围：到这里 inner 才刚布局完，
+        # 它的 <Configure> 未必已经跑过一遍。
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self._center()
+
+    def _on_wheel(self, event):
+        """内容比面板高时，滚轮上下滚（比把整个窗口挪来挪去自然得多）。"""
+        try:
+            if not self.canvas.winfo_exists():
+                return
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        except tk.TclError:
+            pass
 
     def _build_header(self):
         pal = self.pal
@@ -3227,8 +4148,9 @@ class SettingsPanel:
         close.bind("<Leave>", lambda e: close.configure(bg=pal["ink"], fg=pal["border_soft"]))
         self._drag_bind(self.header)
 
-    def _section(self, text):
-        wrap = tk.Frame(self.body, bg=self.pal["paper"])
+    def _section(self, text, parent=None):
+        # parent 默认 self.body：页脚之类挂在面板本体上的仍走老写法
+        wrap = tk.Frame(parent or self.body, bg=self.pal["paper"])
         wrap.pack(fill="x", padx=18, pady=(14, 4))
         tk.Label(wrap, text=text, bg=self.pal["paper"], fg=self.pal["ink"],
                  font=(self.app.fam_cn, 11, "bold")).pack(side="left")
@@ -3236,12 +4158,12 @@ class SettingsPanel:
             side="left", fill="x", expand=True, padx=(10, 0), pady=(7, 0))
         return wrap
 
-    def _build_form(self):
+    def _build_target(self, parent):
         app, pal = self.app, self.pal
 
         # --- 目标时间 ---
-        self._section("目标时刻")
-        box = tk.Frame(self.body, bg=pal["paper"])
+        self._section("目标时刻", parent)
+        box = tk.Frame(parent, bg=pal["paper"])
         box.pack(fill="x", padx=18)
         self.entry = tk.Entry(box, font=(app.fam_num, 17, "bold"), justify="center",
                               bg="#FFFBF2", fg=pal["ink"], relief="flat",
@@ -3253,36 +4175,48 @@ class SettingsPanel:
         self.entry.bind("<KeyRelease>", lambda e: self._preview())
         self.entry.bind("<Return>", lambda e: self._preview())
 
-        self.preview = tk.Label(self.body, text="", bg=pal["paper"], fg=pal["ink_soft"],
+        self.preview = tk.Label(parent, text="", bg=pal["paper"], fg=pal["ink_soft"],
                                 font=(app.fam_cn, 10), anchor="w")
         self.preview.pack(fill="x", padx=20, pady=(5, 0))
 
-        tk.Label(self.body, text="　格式：月.日.时.分　数字之间随便填什么都能认",
+        tk.Label(parent, text="　格式：月.日.时.分　数字之间随便填什么都能认",
                  bg=pal["paper"], fg=pal["border"], font=(app.fam_cn, 9),
                  anchor="w").pack(fill="x", padx=18, pady=(3, 0))
-        tk.Label(self.body, text="　　　例：10.1.11.30 ／ 10.1 8 ／ 10.1/2，32 ／ 2026.10.1",
+        tk.Label(parent, text="　　　例：10.1.11.30 ／ 10 1 0330 ／ 10.1 8 ／ 10.1/2，32",
                  bg=pal["paper"], fg=pal["border"], font=(app.fam_cn, 9),
                  anchor="w").pack(fill="x", padx=18, pady=(1, 0))
+        tk.Label(parent, text="　　　时分秒写在一起也认（0330＝03:30）；"
+                             "年份写在最前面，如 2026.10.1",
+                 bg=pal["paper"], fg=pal["border"], font=(app.fam_cn, 9),
+                 anchor="w").pack(fill="x", padx=18, pady=(1, 0))
+        self._preview()
+
+    def _build_thresholds(self, parent):
+        app, pal = self.app, self.pal
 
         # --- 颜色规则 ---
-        head = self._section("颜色规则")
+        head = self._section("颜色规则", parent)
         tk.Label(head, text="剩余时间 ≤ 阈值时切换", bg=pal["paper"], fg=pal["ink_soft"],
                  font=(app.fam_cn, 9)).pack(side="right")
 
-        self.rules = tk.Frame(self.body, bg=pal["paper"])
+        self.rules = tk.Frame(parent, bg=pal["paper"])
         self.rules.pack(fill="x", padx=18)
         for item in app.cfg.get("thresholds", []):
             self._add_row(item.get("days"), item.get("color"), item.get("bg"))
 
-        add = tk.Label(self.body, text="＋  添加一条规则", bg=pal["paper"], fg=pal["border"],
+        add = tk.Label(parent, text="＋  添加一条规则", bg=pal["paper"], fg=pal["border"],
                        font=(app.fam_cn, 10), cursor="hand2", anchor="w")
         add.pack(fill="x", padx=20, pady=(6, 0))
         add.bind("<Button-1>", lambda e: self._add_row(1, "#B03A2E", None))
         add.bind("<Enter>", lambda e: add.configure(fg=pal["seal"]))
         add.bind("<Leave>", lambda e: add.configure(fg=pal["border"]))
 
+    def _build_window(self, parent):
+        app, pal = self.app, self.pal
+
         # --- 窗口选项 ---
-        self._section("窗口")
+        self._section("窗口", parent)
+        self._build_size_row(parent)
         self.var_lock = tk.BooleanVar(value=bool(app.cfg.get("locked")))
         self.var_top = tk.BooleanVar(value=bool(app.cfg.get("always_on_top", True)))
         # 自启勾选框的初值读注册表现状而非配置：启动项被清掉时不能显示假状态
@@ -3293,7 +4227,7 @@ class SettingsPanel:
                           (self.var_top, "窗口总在最前"),
                           (self.var_autostart, "开机自动运行（写入当前用户启动项）"),
                           (self.var_autoupd, "自动检查新版本（每七天一次，静默不打扰）")):
-            tk.Checkbutton(self.body, text="  " + text, variable=var,
+            tk.Checkbutton(parent, text="  " + text, variable=var,
                            bg=pal["paper"], fg=pal["ink"], selectcolor="#FFFBF2",
                            activebackground=pal["paper"], activeforeground=pal["seal"],
                            font=(app.fam_cn, 10), anchor="w", bd=0,
@@ -3301,17 +4235,106 @@ class SettingsPanel:
 
         self._preview()
 
+    def _build_size_row(self, parent):
+        """
+        窗口尺寸：把「现在多大」写在面板上，并且能直接填数字改。
+
+        显示这一项是用户提的：窗口一直是靠拖边缘调的，拖完到底多大没有一个
+        地方写着。给一个准数之后，既能照着复原，也能让几台机器调成一样。
+        """
+        app, pal = self.app, self.pal
+        row = tk.Frame(parent, bg=pal["paper"])
+        row.pack(fill="x", padx=18, pady=(0, 4))
+
+        tk.Label(row, text="尺寸（宽 × 高）", bg=pal["paper"], fg=pal["ink"],
+                 font=(app.fam_cn, 10)).pack(side="left")
+
+        self.var_w = tk.StringVar()
+        self.var_h = tk.StringVar()
+        self.entry_w = tk.Entry(row, textvariable=self.var_w, width=6,
+                                font=(app.fam_num, 11), justify="center",
+                                bg="#FFFBF2", fg=pal["ink"], relief="flat",
+                                insertbackground=pal["seal"],
+                                highlightthickness=1,
+                                highlightbackground=pal["border_soft"],
+                                highlightcolor=pal["seal"])
+        self.entry_w.pack(side="left", padx=(8, 0), ipady=2)
+        self.entry_w.bind("<Return>", lambda e: self._apply_size())
+
+        tk.Label(row, text="×", bg=pal["paper"], fg=pal["ink_soft"],
+                 font=(app.fam_cn, 10)).pack(side="left", padx=6)
+
+        self.entry_h = tk.Entry(row, textvariable=self.var_h, width=6,
+                                font=(app.fam_num, 11), justify="center",
+                                bg="#FFFBF2", fg=pal["ink"], relief="flat",
+                                insertbackground=pal["seal"],
+                                highlightthickness=1,
+                                highlightbackground=pal["border_soft"],
+                                highlightcolor=pal["seal"])
+        self.entry_h.pack(side="left", ipady=2)
+        self.entry_h.bind("<Return>", lambda e: self._apply_size())
+
+        apply_btn = tk.Label(row, text="应用", bg=pal["paper"], fg=pal["ink_soft"],
+                             font=(app.fam_cn, 10), cursor="hand2",
+                             padx=8, pady=2, relief="solid", bd=1)
+        apply_btn.pack(side="left", padx=(12, 0))
+        apply_btn.bind("<Button-1>", lambda e: self._apply_size())
+        apply_btn.bind("<Enter>",
+                       lambda e: apply_btn.configure(fg=pal["seal"]))
+        apply_btn.bind("<Leave>",
+                       lambda e: apply_btn.configure(fg=pal["ink_soft"]))
+
+        tk.Label(parent, text="　拖窗口边缘也能改；勾了「锁定窗口尺寸」就改不动。",
+                 bg=pal["paper"], fg=pal["border"], font=(app.fam_cn, 9),
+                 anchor="w").pack(fill="x", padx=18, pady=(0, 6))
+
+        self._sync_size()
+        self._poll_size()
+
+    def _sync_size(self):
+        """把主窗口当前尺寸填进两个输入框。用户正在编辑时不动，免得打断他。"""
+        if not hasattr(self, "entry_w"):
+            return
+        try:
+            if self.win.focus_displayof() in (self.entry_w, self.entry_h):
+                return
+        except (tk.TclError, AttributeError):
+            pass
+        w = int(self.app.W or self.app.w or 0)
+        h = int(self.app.H or self.app.h or 0)
+        if self.var_w.get() != str(w):
+            self.var_w.set(str(w))
+        if self.var_h.get() != str(h):
+            self.var_h.set(str(h))
+
+    def _poll_size(self):
+        """窗口被拖着改大小时，面板里的数字跟着变（每半秒看一眼，开销可忽略）。"""
+        try:
+            if not self.win.winfo_exists():
+                return
+            self._sync_size()
+            self.win.after(500, self._poll_size)
+        except tk.TclError:
+            return          # 面板已经关了，轮询自然停下
+
+    def _apply_size(self):
+        err = self.app.resize_to(self.var_w.get(), self.var_h.get())
+        self._sync_size()
+        self.msg.configure(text=err if err else
+                           "窗口已改成 %d × %d" % (self.app.w, self.app.h),
+                           fg=self.pal["seal"] if err else self.pal["ink_soft"])
+
     # ---- 传书设置 ----
 
-    def _build_notify(self):
+    def _build_notify(self, parent):
         app, pal = self.app, self.pal
         nd = app.cfg.get("notify") or {}
 
-        head = self._section("传书 · 邮件提醒")
+        head = self._section("传书 · 邮件提醒", parent)
         tk.Label(head, text="跨过档位即寄信", bg=pal["paper"], fg=pal["ink_soft"],
                  font=(app.fam_cn, 9)).pack(side="right")
 
-        wrap = tk.Frame(self.body, bg=pal["paper"])
+        wrap = tk.Frame(parent, bg=pal["paper"])
         wrap.pack(fill="x", padx=18)
 
         self.var_notify = tk.BooleanVar(value=bool(nd.get("enabled")))
@@ -3566,6 +4589,64 @@ class SettingsPanel:
         except tk.TclError:
             pass
 
+    def _build_shared(self, parent):
+        """
+        「多机共用设置」一节。
+
+        为什么放在面板里而不是做成命令行参数：会用这个功能的人手上有十来台
+        机器要配成一样，他不会为了这个去开命令行。面板里点一下导出、
+        把文件拷过去、在对方机器上导入，三步就完事。
+        """
+        app, pal = self.app, self.pal
+        self._section("多机共用设置", parent)
+
+
+        tk.Label(parent,
+                 text="　把设置导成一份文件，拷到别的机器上；在那台机器的设置面板里\n"
+                      "　点「从文件导入…」选中它，即刻生效（那份文件会留着，不删）。",
+                 bg=pal["paper"], fg=pal["border"], font=(app.fam_cn, 9),
+                 anchor="w", justify="left").pack(fill="x", padx=18, pady=(3, 0))
+        tk.Label(parent,
+                 text="　导出时可以一项一项挑 —— 不挑的那项，对方机器上原样保留。",
+                 bg=pal["paper"], fg=pal["border"], font=(app.fam_cn, 9),
+                 anchor="w", justify="left").pack(fill="x", padx=18, pady=(1, 0))
+        tk.Label(parent,
+                 text="　本机抬头与开机自启不在文件里 —— 每台机器各自设。",
+                 bg=pal["paper"], fg=pal["border"], font=(app.fam_cn, 9),
+                 anchor="w", justify="left").pack(fill="x", padx=18, pady=(1, 0))
+
+        bar = tk.Frame(parent, bg=pal["paper"])
+        bar.pack(fill="x", padx=18, pady=(8, 0))
+        # 导出会顺带把面板里填的东西先保存下来（见 save(then_export=True)），
+        # 所以这里不用提醒「先保存」—— 用户点了就是「我眼前这份，拿出去」。
+        for text, act in (("导出共用设置…", lambda: self.save(then_export=True)),
+                          ("从文件导入…", self._import_shared)):
+            btn = tk.Label(bar, text=text, bg=pal["paper"], fg=pal["ink_soft"],
+                           font=(app.fam_cn, 10), cursor="hand2", padx=10, pady=4,
+                           relief="solid", bd=1)
+            btn.pack(side="left", padx=(0, 10))
+            btn.bind("<Button-1>", lambda e, f=act: f())
+            btn.bind("<Enter>", lambda e, b=btn: b.configure(fg=pal["seal"]))
+            btn.bind("<Leave>", lambda e, b=btn: b.configure(fg=pal["ink_soft"]))
+
+        # 最近一次导入的结果：让用户能确认「文件到底吃进去了没有」，
+        # 而不用去翻注册表。失败信息也显示在这里（文件会留着不删）。
+        last = shared_last_result()
+        if last:
+            status = last.get("status")
+            if status == "applied":
+                tip, color = "上次导入：成功（%s）" % last.get("at", ""), "#4F7A52"
+            elif status == "skipped":
+                tip, color = "上次：文件内容与上次相同，已跳过（%s）" % last.get("at", ""), pal["ink_soft"]
+            else:
+                tip, color = "上次没读成：%s" % last.get("note", ""), pal["seal"]
+        else:
+            tip, color = "（还没导入过。导出一份、拷过去、在对方机器上导入即可。）", pal["border"]
+        self.lbl_shared = tk.Label(parent, text="　" + tip, bg=pal["paper"],
+                                   fg=color, font=(app.fam_cn, 9), anchor="w",
+                                   justify="left", wraplength=(self.W // 2) - 60)
+        self.lbl_shared.pack(fill="x", padx=18, pady=(6, 0))
+
     def _build_footer(self):
         pal = self.pal
         tk.Frame(self.body, bg=pal["border_soft"], height=1).pack(
@@ -3763,14 +4844,21 @@ class SettingsPanel:
         parsed, err = parse_target(text)
         if parsed is None:
             self.preview.configure(text="✕　" + (err or "格式不正确"), fg=self.pal["seal"])
-        else:
-            delta = (parsed - datetime.datetime.now()).total_seconds()
-            self.preview.configure(
-                text="✓　%s　（%s，剩余 %s）" % (
-                    pretty_target(parsed),
-                    parsed.strftime("%Y-%m-%d %H:%M"),
-                    _human_delta(delta)),
-                fg="#4F7A52")
+            return
+        delta = (parsed - datetime.datetime.now()).total_seconds()
+        msg = "✓　%s　（%s，剩余 %s）" % (
+            pretty_target(parsed),
+            parsed.strftime("%Y-%m-%d %H:%M"),
+            _human_delta(delta))
+        # 末尾那段若是个「像最近几年的四位数」，它会被按时:分读掉（2026 → 20:26）。
+        # 这里多嘴一句：真想写年份的人多半是把位置放错了，
+        # 光看 ✓ 那一行未必反应得过来。
+        toks = re.findall(r"\d+", text)
+        slot = 3 if toks and len(toks[0]) == 4 else 2
+        if len(toks) > slot and looks_like_recent_year(toks[slot]):
+            msg += "　——「%s」被当成了时分；要写年份请放在最前面，如 %s.10.1" % (
+                toks[slot], toks[slot])
+        self.preview.configure(text=msg, fg="#4F7A52")
 
     def _collect(self):
         out = []
@@ -3790,7 +4878,15 @@ class SettingsPanel:
             })
         return out, None
 
-    def save(self):
+    def save(self, then_export=False):
+        """
+        保存。
+
+        then_export=True 时走「先存再导出」：面板上的「导出共用设置」用它 ——
+        导出的必须是用户眼前这一份设置，而不是上次存过的旧值，所以先走一遍
+        保存（校验、落盘、界面刷新全都照旧），成功了接着弹保存对话框。
+        校验没过时照旧把原因写在面板底部，什么都不会导出。
+        """
         thresholds, err = self._collect()
         if err:
             self.msg.configure(text=err)
@@ -3833,7 +4929,77 @@ class SettingsPanel:
         if err:
             self.msg.configure(text=err)
             return
+        if then_export:
+            self._export_shared()
+            return
         self.close()
+
+    def _export_shared(self):
+        """
+        导出共用设置（面板上那个按钮的落地动作）—— 分两步走。
+
+        先弹一个小窗挑「带哪几项」，挑完才选路径写文件。中间那一步不是
+        多余：用户手上是十几台机器，绝大多数设置想配成一样，可目标时刻
+        每台都不同。挑一次只要几秒，事后发现时刻被冲掉了要重配十台。
+
+        调用它的入口已经先保存过了，所以拿到的 cfg 与 secret 都是最新的。
+        """
+        self._picker = ExportPicker(self.app, self._write_shared)
+
+    def _write_shared(self, selection):
+        """挑完之后的落地动作：选路径 → 写文件 → 把接下来该干什么讲清楚。"""
+        path = filedialog.asksaveasfilename(
+            parent=self.win, title="导出共用设置",
+            initialfile=SHARED_FILE, defaultextension=".json",
+            initialdir=self._home_dir(),
+            filetypes=[("设置文件", "*.json"), ("全部文件", "*.*")])
+        if not path:
+            return                       # 用户取消了，面板留着不动
+        ok, why = export_shared_config(path, self.app.cfg, self.app.secret,
+                                       selection)
+        self.close()
+        if not ok:
+            messagebox.showerror("导出失败", "文件没能写出来：\n%s" % why)
+            return
+        names = "、".join(it["label"] for it in SHARED_ITEMS
+                          if selection.get(it["key"]))
+        left = "、".join(it["label"] for it in SHARED_ITEMS
+                         if not selection.get(it["key"])) or "（无）"
+        messagebox.showinfo(
+            "已导出",
+            "设置已导出到：\n%s\n\n"
+            "这一份里带了：%s\n"
+            "没带的（对方机器上原样保留）：%s\n\n"
+            "接下来：把这份文件拷到别的机器上（U 盘、共享都行），在那台机器的\n"
+            "设置面板里点「从文件导入…」选中它，设置当场就换过去了。\n\n"
+            "· 本机抬头、开机自启不在文件里，每台机器各自设。\n"
+            "· 文件里可能有你的邮箱授权码，是明文：别放进公共网盘、别发到群里。\n"
+            "· 这份文件不会被删 —— 它就是母本，留着以后接着用。"
+            % (path, names, left))
+
+    def _import_shared(self):
+        """从文件导入设置（不删文件 —— 这是用户自己挑的那份，可能是母本）。"""
+        path = filedialog.askopenfilename(
+            parent=self.win, title="选择共用设置文件",
+            initialdir=self._home_dir(),
+            filetypes=[("设置文件", "*.json"), ("全部文件", "*.*")])
+        if not path:
+            return
+        err = self.app.import_shared_from(path)
+        if err:
+            messagebox.showerror("导入失败", err)
+            return
+        self.close()
+        messagebox.showinfo("已导入",
+                            "设置已经读进来，界面也按新设置刷新了。\n\n"
+                            "文件里没有的项本机保持原样：抬头、开机自启，"
+                            "以及导出时没勾上的那些。")
+
+    def _home_dir(self):
+        """对话框的起始目录：优先桌面，没有就退到用户主目录。"""
+        home = os.path.expanduser("~")
+        desk = os.path.join(home, "Desktop")
+        return desk if os.path.isdir(desk) else home
 
     def _factory_reset(self):
         """
@@ -4012,8 +5178,23 @@ class SettingsPanel:
         os._exit(0)
 
     def close(self):
+        # 滚轮是 bind_all 挂上去的（面板里所有控件都能滚），关窗必须解绑，
+        # 否则这扇窗没了，滚轮事件还在往一个已销毁的 canvas 上送。
+        try:
+            self.win.unbind_all("<MouseWheel>")
+        except tk.TclError:
+            pass
         if self._color_popup is not None:
             self._dismiss_palette(self._color_popup)
+        # 挑选项的小窗还开着的话一起关掉 —— 面板没了它留着，会变成一扇
+        # 点什么都回不去的孤儿窗（它的回调还要往已销毁的面板上挂对话框）。
+        picker = getattr(self, "_picker", None)
+        if picker is not None:
+            self._picker = None
+            try:
+                picker.close()
+            except Exception:
+                pass
         self.app._settings = None
         try:
             self.win.destroy()
@@ -4031,45 +5212,6 @@ class SettingsPanel:
         # 至少保证标题栏能够得着 —— 否则用户连关都关不掉。
         top = max(8, min((sh - h) // 2 - 40, sh - h - 16))
         set_geometry(self.win, w, h, (sw - w) // 2, top)
-        self._scroll_y = None            # 重新居中后，滚轮的基准要重新取
-
-    def _wheel_scroll(self, event):
-        """
-        面板比屏幕还高时，用滚轮把窗口上下挪，好让底部的「保存」够得着。
-
-        为什么不改成滚动条：面板是可拖拽的无边框窗口，挪窗口是最小改动，
-        而且不动任何既有布局。面板本来放得下时这个函数直接什么都不做。
-
-        位移基准用自己记的 _scroll_y，不去读 winfo_y()：
-        Tk 收到 geometry 请求后，要等窗口真的动了 winfo_y() 才会变；
-        滚轮事件比窗口移动快，读 winfo_y() 会一直拿到旧值，
-        于是每次都从同一个起点重算 —— 表现为「滚轮完全没反应」。
-        """
-        h = self.win.winfo_height()
-        sh = self.win.winfo_screenheight()
-        if h <= sh - 16:
-            return
-
-        # 顶边留 8px、底边留 8px。面板比屏幕高时，后者必然是负数。
-        top, bottom = 8, sh - h - 8
-        cur = self._scroll_y
-        if cur is None:                      # 首次使用，或刚被拖动过
-            cur = self.win.winfo_y()
-
-        try:
-            ticks = int(event.delta) / 120.0
-        except (TypeError, ValueError):
-            ticks = -1.0
-        if ticks == 0:
-            ticks = -1.0
-        # 方向：Windows 上 delta<0 是向下滚，要露出面板下半部分，
-        # 窗口本身得往上挪（y 变小）。
-        y = min(top, max(bottom, cur + int(ticks * 40)))
-        self._scroll_y = y
-        # y 多半是负数，只能走 set_window_pos —— Tk 的 geometry 会把「-292」
-        # 理解成「距屏幕底边 292」，而不是「y 等于 -292」。
-        set_window_pos(self.win, self.win.winfo_x(), y)
-        return "break"
 
     def _drag_bind(self, widget):
         widget.bind("<Button-1>", self._drag_start)
@@ -4077,7 +5219,6 @@ class SettingsPanel:
 
     def _drag_start(self, event):
         self._pt = (event.x_root - self.win.winfo_x(), event.y_root - self.win.winfo_y())
-        self._scroll_y = None            # 拖动改过位置，滚轮的基准要重新取
 
     def _drag_move(self, event):
         if not hasattr(self, "_pt"):
@@ -4178,6 +5319,9 @@ def main():
     # 旧 exe（.old）不在这儿清了：它现在是「新版本连续稳定启动满几次」才删，
     # 触发点挂在窗口起来 60 秒之后（见 note_successful_run / _note_run_ok）。
     migrate_legacy_files()   # 老版本的配置/凭据/履历文件搬进注册表（一次性）
+    # 这里曾经会在启动时扫 exe 旁边有没有共用设置文件、有就读走并删掉
+    # （v1.6 起去掉了 —— 见 apply_shared_file 的说明）。现在导入只走设置面板
+    # 那条路：什么时候导、导哪一份，都由用户当场挑，程序不擅自改设置。
     app = CountdownApp()
     app.run()
 
