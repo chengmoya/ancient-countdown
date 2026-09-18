@@ -42,14 +42,6 @@
 
 - 双击 `启动倒计时.bat`，或命令行运行 `pythonw AncientCountdown.pyw`
 
-### 重新打包 exe
-
-```
-python 打包.py
-```
-
-脚本把 PyInstaller 打包 → 冒烟测试 → 自检串成一条流水线，产物落在 `发布/` 目录。
-
 ## 目录结构
 
 | 文件 | 说明 |
@@ -57,11 +49,6 @@ python 打包.py
 | `AncientCountdown.pyw` | 主程序 |
 | `mailer.pyw` | 传书使者 —— 独立发信小程序，被主程序按需唤起，发完即退 |
 | `启动倒计时.bat` | 源码版启动入口 |
-| `自检.pyw` | 自检工具，排查问题时运行 |
-| `打包.py` | 一键打包 exe（含冒烟测试与自检） |
-| `发版.py` | 发版工具（打 zip、双平台挂 Release、刷新在线升级公告、体检） |
-| `测试_升级模块.py` | 在线升级逻辑的回归测试（免令牌，含真实网络查询） |
-| `测试_升级端到端.py` | 真机跑一遍完整升级流程（需 CNB 令牌） |
 | `发行说明.txt` | 下一版要说给用户听的更新说明，发版前改这里 |
 | `使用说明.md` | 完整使用文档 |
 | `发布/` | 本地打包产物（exe 与发布包 zip 不入库，正式下载走 [Releases](https://github.com/chengmoya/ancient-countdown/releases)） |
