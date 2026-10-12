@@ -13,7 +13,8 @@
 
 怎么被调用（由 AncientCountdown.pyw 自动完成，不需要手动运行）
   pythonw mailer.pyw
-  从注册表读任务（notify_task），寄出后把结果写回注册表（notify_result）。
+  从数据目录里的信箱文件读任务（notify_task.json），
+  寄出后把结果写回另一个信箱文件（notify_result.json）。
 
 退出码
   0 = 寄出成功    1 = 寄出失败    2 = 任务缺失或损坏
@@ -24,13 +25,9 @@ import os
 import smtplib
 import ssl
 import sys
-import winreg
 from email.message import EmailMessage
 from email.utils import formataddr
 
-# 数据仓在注册表里。键名由主程序通过环境变量指定（带演练隔离后缀），
-# 拿不到 env 就用默认键 —— 源码模式手工调用时读写的正是真实数据。
-REGKEY = os.environ.get("ANCIENT_COUNTDOWN_REGKEY") or r"Software\AncientCountdown"
 TASK_NAME = "notify_task"
 RESULT_NAME = "notify_result"
 TEST_RESULT_NAME = "notify_test_result"
@@ -38,43 +35,68 @@ TIMEOUT = 25.0          # 单次网络操作上限，避免进程僵在那里
 ERR_LIMIT = 300
 
 
-def _reg_value(name):
+def data_dir():
+    """
+    数据目录在哪。
+
+    主程序派生发信进程时一定会带上 ANCIENT_COUNTDOWN_HOME（那是「数据放在
+    这个目录」的唯一途径，演练时它指向隔离目录）；拿不到就用默认位置 ——
+    源码模式手工跑这个脚本时，读写的正是真实数据。
+    """
+    override = os.environ.get("ANCIENT_COUNTDOWN_HOME")
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"), ".古风倒计时")
+
+
+DATA_DIR = data_dir()
+TASK_PATH = os.path.join(DATA_DIR, TASK_NAME + ".json")
+RESULT_PATH = os.path.join(DATA_DIR, RESULT_NAME + ".json")
+TEST_RESULT_PATH = os.path.join(DATA_DIR, TEST_RESULT_NAME + ".json")
+
+
+# 任务与结果各自一个小文件，**不和主程序那份设置文件共用**。
+#
+# 为什么：两个进程各写各的才安全。若共用一份设置文件，双方都是
+# 「读全文 → 改一处 → 写回全文」，主程序这头写的设置会被发信进程
+# 那头写回的结果整段盖掉（反过来也一样），而丢的是用户刚改的设置。
+# 拆开之后谁也不会覆盖谁，代价只是多两个瞬时小文件。
+def _read_json(path):
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REGKEY, 0,
-                            winreg.KEY_READ) as key:
-            raw, _ = winreg.QueryValueEx(key, name)
-        return json.loads(raw)
+        with open(path, "r", encoding="utf-8") as fp:
+            return json.load(fp)
     except (OSError, ValueError):
         return None
 
 
-def _set_reg_value(name, data):
+def _write_json(path, data):
+    """先写 .tmp 再改名 —— 主程序可能正好在同一瞬间来读，不能让它读到半个文件。"""
     try:
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, REGKEY) as key:
-            winreg.SetValueEx(key, name, 0, winreg.REG_SZ,
-                              json.dumps(data, ensure_ascii=False))
+        with open(path + ".tmp", "w", encoding="utf-8") as fp:
+            json.dump(data, fp, ensure_ascii=False)
+        os.replace(path + ".tmp", path)
         return True
     except OSError:
         return False
 
 
-def _del_reg_value(name):
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REGKEY, 0,
-                            winreg.KEY_SET_VALUE) as key:
-            winreg.DeleteValue(key, name)
-    except OSError:
-        pass
+def _remove(path):
+    for p in (path, path + ".tmp"):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
 
 
 def write_result(name, token, ok, error=""):
-    """把结果写回注册表。主程序下一轮巡检会来取走。"""
+    """把结果写回信箱。主程序下一轮巡检会来取走。"""
     payload = {"token": token, "ok": bool(ok), "error": (error or "")[:ERR_LIMIT]}
-    _set_reg_value(name, payload)
+    _write_json(TEST_RESULT_PATH if name == TEST_RESULT_NAME else RESULT_PATH,
+                payload)
 
 
 def read_task():
-    task = _reg_value(TASK_NAME)
+    task = _read_json(TASK_PATH)
     if not isinstance(task, dict):
         raise ValueError("task missing or damaged")
     return task
@@ -82,7 +104,7 @@ def read_task():
 
 def drop_task():
     """任务里带着授权码，无论成败都要立刻抹掉。"""
-    _del_reg_value(TASK_NAME)
+    _remove(TASK_PATH)
 
 
 def build_message(task, user):
