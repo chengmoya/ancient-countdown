@@ -57,7 +57,7 @@
 | `启动倒计时.bat` | 源码版启动入口 |
 | `发行说明.txt` | 下一版要说给用户听的更新说明，发版前改这里 |
 | `使用说明.md` | 完整使用文档 |
-| `发布/` | 本地打包产物（exe 与发布包 zip 不入库，正式下载走 [Releases](https://github.com/chengmoya/ancient-countdown/releases)） |
+| `发布/` | 本地打包产物（exe 与发布包 zip 不入库，正式下载走 [Releases](https://github.com/chengmoya/ancient-countdown/releases)；`默认配置.json` 由 `生成默认配置.py` 在打包时从 `DEFAULT_CONFIG` 现生成，随包一起提交留档） |
 
 > 程序**不会**在文件夹里生成任何配置文件 —— 目标时刻、窗口位置、传书设置、
 > **邮箱授权码**、寄信履历全部存在用户目录下的

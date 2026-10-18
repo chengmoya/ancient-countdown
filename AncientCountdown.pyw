@@ -50,7 +50,7 @@ APP_SUB = "ANCIENT COUNTDOWN"
 # 在线升级靠它判断「有没有新版」：两边都是 "主.次" 两段数字，
 # 比较时拆成 (1, 3) 这样的小元组比大小 —— 字符串比会出事，
 # "1.10" < "1.9" 在字符串世界里是成立的，那会让用户升不上去。
-APP_VERSION = "1.9"
+APP_VERSION = "1.10"
 
 MIN_W, MIN_H = 300, 150          # 窗口最小尺寸
 # 数字字号的下限。宁可让它稍微顶出一点，也不缩到看不清：
@@ -216,18 +216,28 @@ SHUTDOWN_SOURCES = (("remote", "网址取回"),
 # 场景：无人值守的机器上挂着游戏，万一游戏窗口没了（掉线、崩了、被谁关了），
 # 得有人知道。做法是定时看一眼那扇窗还在不在。
 #
-# 两条要紧的规矩：
+# 三条要紧的规矩：
 #   · **必须先看见过它**，之后不见了才算「消失」。机器刚开机、游戏还没起来时
 #     一直看不见它，那时候发信是纯骚扰。
-#   · 消失之后**不立刻发信**，先弹一扇窗问一句「是你自己关的吗」。
-#     无人值守时没人应答，倒计时走完照样把信寄出去 —— 默认是「寄」，
-#     不确认就等于「我不知道，按最坏情况处理」。
-WATCH_STATE_KEY = "watch_state"          # 盯守状态机（存注册表，重启后接着盯）
+#   · **机器重启过就推回「等出现」**（_disarm_watch_after_reboot 比开机时刻）。
+#     状态存在数据文件里，不推倒的话每次开机都会白寄一封信。
+#   · 消失之后**不立刻发信**，先弹一扇窗问一句「是你自己关的吗」，同时
+#     **继续核实**（每 30 秒一次）：倒计时的每一分钟都要求它确实还不在，
+#     这中间它只要又出现过一次就当场撤销。无人应答时倒计时走完照样把信
+#     寄出去 —— 默认是「寄」，不确认就等于「我不知道，按最坏情况处理」。
+WATCH_STATE_KEY = "watch_state"          # 盯守状态机（存数据文件，重启后接着盯）
 ALERT_STATE_KEY = "alert_state"          # 盯守通知的寄信记录
 WATCH_PROBE_MIN = 1                      # 巡检间隔的下限（分钟）
 WATCH_PROBE_MAX = 1440                   # 上限一天 —— 比这更稀就不叫盯守了
-WATCH_GRACE_MIN = 1                      # 「等多久没人理就发信」的下限（分钟）
-WATCH_GRACE_MAX = 1440
+WATCH_GRACE_MIN = 1                      # 「连续不见多少分钟才寄信」的下限（分钟）
+WATCH_GRACE_MAX = 1440                   # 上限一天 —— 比这更长就不叫告警了
+WATCH_CONFIRM_SEC = 30                   # 问话期间每隔多少秒核实一次窗口在不在
+                                         # （「持续不在线 N 分钟才寄信」的落地：
+                                         #  这 N 分钟里它只要又出现过一次就撤销）
+WATCH_BOOT_DRIFT_SEC = 120               # 比对「开机时刻」时的容差（秒）。
+                                         # 墙上时钟被 NTP 调过几分钟也算「重启过」——
+                                         # 那是往安全的方向错：最多晚一会儿寄信，
+                                         # 不会白寄（见 _disarm_watch_after_reboot）。
 WINDOW_LIST_MAX = 120                    # 下拉框最多列这么多扇窗，防菜单长到屏幕外
 WATCH_DRILL_SEC = 60                     # 「演练」时问话窗等多少秒就自动寄信
                                          # （真实盯守按 grace_min 分钟；演练是当场看
@@ -336,6 +346,19 @@ DEFAULT_CONFIG = {
         "auto_fetch": True,         # 启动时自动取一次
         "refresh_hours": 6.0,       # 之后每隔几小时再取一次（0 = 不再自动取）
         "grace_sec": SHUTDOWN_GRACE_DEFAULT,   # 确认窗等你几秒
+        # 关机时刻的**另一个指定来处**：设置文件里直接写死一个时刻。
+        # 远程设置 / 共用设置那份文件带上这一项，各台机器取回来就是关机时刻 ——
+        # 用户只维护一份配置文件（远程设置本来就会定时下载），不必再单独
+        # 维护一个「返回日期数字的网址」。写法同 target（如 "2026.10.20.18.00"），
+        # 留空 = 没指定；写 "" 可以撤掉。
+        #
+        # 它和 url 那条喂的是**同一个变量** self.shutdown_at（来源都记 "remote"）：
+        #   · 运行期内谁后到谁算数（网址取到新值会当场覆盖，远程设置拉回来也会）；
+        #   · 重启后以这份文件里的值为准（见 _restore_shutdown_at）——
+        #     文件是用户此刻明确写下的值，site_date 只是「上次网址取到了什么」。
+        # ⚠️ 它同样绝不碰 cfg["target"]：主界面那个倒计时各机器各自设，
+        #    这是用户点名划的线（见自检里「主界面倒计时目标没被改掉」那几条）。
+        "at": "",
     },
 
     # 窗口盯守：盯着某一扇窗，它不见了就寄信告诉你。
@@ -344,7 +367,7 @@ DEFAULT_CONFIG = {
         "enabled": False,
         "title": "",                # 要盯的窗口名称（关键字，短一点更稳）
         "interval_min": 30,         # 多久看一眼（分钟）
-        "grace_min": 10,            # 不见了之后，等多久没人应答就自动寄信
+        "grace_min": 10,            # 连续不见多少分钟才寄信（期间反复核实，它一出现就撤销）
         # 「窗口下次出现时自动接着盯」是**写死的行为**，没有开关：
         # 无人值守的机器上，一次通报之后当然要接着盯，否则第二次掉线就没人知道了。
         # 落地方式见 finish_watch_alert（处理完一律退回 waiting 那一档）。
@@ -1116,11 +1139,11 @@ SHARED_ITEMS = (
      "hint": "默认不带：能改这一项的文件，等于能决定你的授权码发到哪台服务器",
      "drop": (("config", "notify", "host"), ("config", "notify", "port"),
               ("config", "notify", "use_ssl"), ("config", "notify", "provider"))},
-    {"key": "shutdown", "label": "定时关机（含取日期的网址）", "default": True,
-     "hint": "各机器的网址不一样的话就别带这一项",
+    {"key": "shutdown", "label": "定时关机（网址与关机时刻）", "default": True,
+     "hint": "各机器的网址或关机时刻不一样的话就别带这一项",
      "drop": (("config", "shutdown"),)},
     {"key": "watch", "label": "窗口盯守设置", "default": True,
-     "hint": "盯哪扇窗、隔多久看一次、没人应答多久后自动发信",
+     "hint": "盯哪扇窗、隔多久看一次、连续不见多久才寄信",
      "drop": (("config", "watch"),)},
     {"key": "pins", "label": "锁定与置顶", "default": True,
      "hint": "是否锁定尺寸、是否总在最前",
@@ -3316,6 +3339,31 @@ def window_present(keyword, titles=None):
     return False
 
 
+def tick_count():
+    """开机以来的毫秒数（GetTickCount64，随开机归零）。取不到就返回 0。"""
+    if os.name != "nt":
+        return 0
+    try:
+        import ctypes
+        return int(ctypes.windll.kernel32.GetTickCount64())
+    except Exception:                                   # noqa: BLE001
+        return 0
+
+
+def boot_at():
+    """
+    本次开机的墙上时钟时刻（epoch 秒）。
+
+    开机毫秒数随开机归零，拿它和 time.time() 一减就是「这次开机是几点」。
+    盯守靠它判断「机器重启过没有」—— 见 _disarm_watch_after_reboot。
+    时钟被调过会让它有偏差，调用处按容差（WATCH_BOOT_DRIFT_SEC）处理。
+    """
+    t = tick_count()
+    if not t:
+        return 0.0
+    return time.time() - t / 1000.0
+
+
 def load_watch_state():
     st = reg_store_read(WATCH_STATE_KEY, {})
     if not isinstance(st, dict):
@@ -3326,6 +3374,8 @@ def load_watch_state():
     st.setdefault("note", "")
     st.setdefault("rounds", 0)
     st.setdefault("last_probe", 0.0)
+    st.setdefault("seen_boot", 0.0)     # 上次看见那扇窗时的开机时刻（判断机器重启过没有）
+    st.setdefault("pend_probe", 0.0)    # 问话期间上一次核实窗口在不在的时刻
     if not isinstance(st.get("pending"), dict):
         st["pending"] = {}
     return st
@@ -3381,6 +3431,7 @@ class CountdownApp:
         self._site_fetching = False     # 取日期正在进行中，防重复点
         self._alert_win = None          # 「窗口不见了」那扇确认窗（真出事时）
         self._drill_win = None          # 「试一遍」演练用的那扇窗（另占一个槽）
+        self._disarm_watch_after_reboot()   # 机器重启过 → 盯守推回「等出现」
         self._watch_note = ""
         # 下一次允许自动取日期的时刻。启动后先静置二十秒：一是把开机那几秒
         # 留给窗口本身（别让它跟启动抢网络），二是刚开机时网络栈往往还没起来，
@@ -3390,7 +3441,8 @@ class CountdownApp:
         # 静置的是「自动拉」；用户在面板上点「现在就拉」不受这个限制。
         self._remote_fetching = False
         self._remote_next_at = time.time() + SITE_FETCH_START_DELAY
-        # 远程关机时刻 —— 只由网址取回的那串数字决定，**自己单独一份**。
+        # 远程关机时刻 —— 只由「网址取回的数字」或「设置文件里写死的 at」
+        # 决定，**自己单独一份**。
         # 单独存的原因：它和 self.target 是两件事，用户设的倒计时不该被
         # 「去网站取了一次数」悄悄换掉（v1.6 就是这么错的，别退回那个做法）。
         # 从数据仓里恢复，所以重启程序之后还认得已经排上的关机时刻。
@@ -5043,14 +5095,23 @@ class CountdownApp:
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
         set_geometry(win, w, h, (sw - w) // 2, max(20, (sh - h) // 3))
 
-    # ---------------- 定时关机（日期取自自己的网站）----------------
+    # ---------------- 定时关机（时刻取自网址或设置文件）----------------
     #
     # 流程一句话讲清：
-    #   网址 → （后台线程）取回一串日期数字 → 解析成时刻 → 成为倒计时目标
-    #   → 倒计时归零 → 发关机命令（留一段缓冲可取消）
+    #   网址 → （后台线程）取回一串日期数字 → 解析成时刻 → 成为**关机时刻**
+    #   → 到点 → 弹确认窗 → 发关机命令（留一段缓冲可取消）
     #
-    # 为什么目标时刻由网站说了算，而不是让用户自己填：那头随时会改，
+    # 关机时刻还有第二个来处：**设置文件里写死的 shutdown.at**（远程设置 /
+    # 共用设置那份文件带上它即可）。用户只维护一份配置文件 —— 反正远程设置
+    # 也会定时下载，关机时刻写在里面，各台机器取回来就排上，不必再单独
+    # 维护一个返回日期数字的网址。两条路喂的是同一个 self.shutdown_at，
+    # 重启后以文件里的值为准（见 _restore_shutdown_at）。
+    #
+    # 为什么时刻可以由网址/文件说了算，而不是让用户在本机填：那头随时会改，
     # 改完这边不用动；填死一个时刻的话，每次改都得跑到这台机器上来改。
+    #
+    # ⚠️ 关机时刻与 self.target（用户倒计时目标）是两个变量，绝不合并 ——
+    # 取一次数就把用户设的日子换掉，是 v1.6 犯过的错。
 
     def shutdown_cfg(self):
         return self.cfg.get("shutdown") or {}
@@ -5312,11 +5373,27 @@ class CountdownApp:
 
     def _restore_shutdown_at(self):
         """
-        从注册表把上次取到的关机时刻读回来（重启程序后接着用）。
+        把关机时刻读回来（重启程序后接着用）。两个来处，**设置文件里写的优先**：
 
-        只认 site_date 里那份「已采用」的记录；读不出、或那份记录本身
-        标着没采用，就当没有关机时刻 —— 宁可这次不关，也绝不凭空猜一个。
+          ① cfg["shutdown"]["at"] —— 远程设置 / 共用设置那份文件里直接指定的时刻。
+             用户只维护一份配置文件（远程设置本来就会定时下载），关机时刻写在
+             里面即可，不必再单独维护一个返回日期数字的网址。
+          ② site_date 里那份「已采用」的记录 —— 网址取回那条路的落点。
+
+        为什么文件优先：文件是用户此刻明确写下的值；site_date 只是「上次网址
+        取到了什么」的历史记录。两份都在时（既用网址又用设置文件），重启以文件
+        为准；运行期内网址取到新值会当场覆盖（apply_shutdown_at），下次重启
+        又回到文件那一份 —— 两条路喂的是同一个 self.shutdown_at。
+
+        文件里那个时刻读不通（手写坏了）时当没写，继续看 site_date，不报错。
+        两份都读不出、或记录本身标着没采用，就当没有关机时刻 ——
+        宁可这次不关，也绝不凭空猜一个。
         """
+        text = ((self.cfg.get("shutdown") or {}).get("at") or "").strip()
+        if text:
+            dt, _err = parse_target(text)
+            if dt is not None:
+                return dt
         info = self.site_date if isinstance(self.site_date, dict) else {}
         if not info.get("ok"):
             return None
@@ -5328,7 +5405,12 @@ class CountdownApp:
 
     def apply_shutdown_at(self, dt):
         """
-        把网站给的日期数字落成**关机时刻**。返回 (是否已采用, 说明)。
+        把取到的时刻落成**关机时刻**。返回 (是否已采用, 说明)。
+
+        网址取回那条路走这里（_site_fetched 调它）。设置文件那条路
+        （cfg["shutdown"]["at"]）不走这里 —— 它经 reload_from_store →
+        _restore_shutdown_at 直接落 self.shutdown_at（reload 时 _armed_keys
+        整个重置，效果一样）。
 
         这里刻意**不碰** self.cfg["target"] 与 self.target。
         那个是用户自己设的倒计时目标，和「这台机器几点关」是两件事；
@@ -5667,12 +5749,16 @@ class CountdownApp:
     # 状态机只有三档，写清楚免得绕晕：
     #   waiting   还没看见过这扇窗。看见了就转 watching。
     #             「开机时游戏还没起来」就停在这一档 —— 一直看不见不算消失，
-    #             否则每次开机都会白寄一封信。
+    #             否则每次开机都会白寄一封信。机器重启过也会被推回这一档
+    #             （见 _disarm_watch_after_reboot）。
     #   watching  看见过、现在正盯着。某一趟看不见了就转 pending。
-    #   pending   不见了，弹窗问「是你自己关的吗」。没人应答就寄信。
+    #   pending   不见了，弹窗问「是你自己关的吗」，**同时每 30 秒核实一次
+    #             它是不是真的还不在** —— 这就是「持续不在线十分钟才寄信」：
+    #             这十分钟里它只要又出现过一次，就当场撤销（退回 watching），
+    #             一封信都不寄。倒计时走完（它始终没再出现）就寄信。
     #             不论答没答，处理完都回到 waiting：窗口再出现时自动接着盯。
     #
-    # 三档连同窗口名都写在注册表里，所以重启程序之后接着盯，不需要重新选窗口。
+    # 三档连同窗口名都写在数据文件里，所以重启程序之后接着盯，不需要重新选窗口。
 
     def watch_cfg(self):
         return self.cfg.get("watch") or {}
@@ -5689,10 +5775,43 @@ class CountdownApp:
         """换了一扇要盯的窗 = 换了一件事：状态机整个推倒，别把旧窗口的历史带过来。"""
         st = self.watch_state
         st.update({"phase": "waiting" if keyword else "off", "keyword": keyword,
-                   "seen_at": "", "rounds": 0, "last_probe": 0.0, "pending": {},
+                   "seen_at": "", "seen_boot": 0.0, "rounds": 0,
+                   "last_probe": 0.0, "pend_probe": 0.0, "pending": {},
                    "note": note or ("等「%s」出现" % keyword if keyword else "")})
         save_watch_state(st)
         self._close_alert_window()
+
+    def _disarm_watch_after_reboot(self):
+        """
+        程序启动时：机器重启过 → 把盯守状态推回「等出现」（waiting）。
+
+        为什么必须有这一条：盯守状态存在数据文件里，为的是重启程序接着盯。
+        但「重启程序」和「重启机器」是两回事。机器重启之后，那扇窗往往还没
+        起来（或者得用户手动开）—— 而状态里还留着上次的 watching，第一趟
+        巡检就「发现窗口不见了」→ 弹窗 → 十分钟后寄信。每次开机都白寄一
+        封信，就是这么来的（用户说的「刚开机的时候」）。
+
+        怎么判断机器重启过：比开机时刻。开机毫秒数随开机归零，和墙上时钟
+        一减就是「这次开机是几点」；状态里记着「上次看见那扇窗时的开机
+        时刻」（seen_boot）。两个时刻不是同一次开机 → 这中间重启过 → 推倒。
+        程序只是重启、机器没重启 → 原样保留（该弹的窗还会被
+        ensure_alert_window 叫回来）。墙上时钟被调过几分钟也算「重启过」——
+        那是往安全的方向错：最多晚一会儿寄信，不会白寄。
+        """
+        st = self.watch_state
+        if st.get("phase") not in ("watching", "pending"):
+            return
+        seen_boot = st.get("seen_boot")
+        if not isinstance(seen_boot, (int, float)) or seen_boot <= 0:
+            seen_boot = None          # 升级上来的老状态没有这一笔：宁可推倒重来
+        if seen_boot is None or abs(boot_at() - seen_boot) > WATCH_BOOT_DRIFT_SEC:
+            st.update({"phase": "waiting", "pending": {}, "pend_probe": 0.0,
+                       "last_probe": 0.0, "rounds": 0, "seen_at": "",
+                       "seen_boot": 0.0,
+                       "note": "机器重启过，等「%s」再出现"
+                               % (st.get("keyword") or "")})
+            save_watch_state(st)
+            self._close_alert_window()
 
     def watch_tick(self, now):
         cfg = self.watch_cfg()
@@ -5711,8 +5830,33 @@ class CountdownApp:
             return
 
         if st.get("phase") == "pending":
-            # 已经问过、还没答：这时候不再巡检（窗口本来就该不在），
-            # 只保证那扇问话窗还立着 —— 它自己带着倒计时，到点会回来找我们。
+            # 问话窗开着。这时候**继续核实**那扇窗在不在 —— 这就是「持续
+            # 不在线十分钟才寄信」：倒计时的每一分钟都要求它确实还不在，
+            # 这中间它只要又出现过一次，就当场撤销，不当它消失过。
+            # （早先的版本这十分钟是闭着眼数的：窗口回来了信照样寄。）
+            clock = now.timestamp()
+            if clock - float(st.get("pend_probe") or 0) >= WATCH_CONFIRM_SEC:
+                st["pend_probe"] = clock
+                if window_present(keyword):
+                    # 它回来了：虚惊一场。不走 finish —— 那不是「用户确认
+                    # 自己关的」，是窗口自己回来了，一封信都不该寄。
+                    st.update({"phase": "watching", "pending": {},
+                               "pend_probe": 0.0, "last_probe": clock,
+                               "seen_at": _stamp(), "seen_boot": boot_at(),
+                               "rounds": int(st.get("rounds") or 0) + 1,
+                               "note": "它又出现了，虚惊一场，接着盯"})
+                    save_watch_state(st)
+                    # 只收真出事那扇窗：演练那扇（如果在演）走的是另一条
+                    # 时间线，不该被真实盯守的撤销带走。
+                    win = self._alert_win
+                    self._alert_win = None
+                    if win is not None:
+                        try:
+                            win.close()
+                        except Exception:              # noqa: BLE001
+                            pass
+                    return
+                save_watch_state(st)
             self.ensure_alert_window()
             return
 
@@ -5728,6 +5872,8 @@ class CountdownApp:
             # 时一直看不见它，那时候发信纯粹是骚扰。
             st["phase"] = "watching" if here else "waiting"
             st["seen_at"] = _stamp() if here else ""
+            if here:
+                st["seen_boot"] = boot_at()  # 这次开机里见过它（重启判断靠这笔）
             st["rounds"] = 0
             st["note"] = ("已看到「%s」，开始盯守" % keyword) if here \
                 else "还没看到这个窗口，等它出现"
@@ -5736,6 +5882,7 @@ class CountdownApp:
 
         if here:
             st["rounds"] = int(st.get("rounds") or 0) + 1
+            st["seen_boot"] = boot_at()      # 还在：刷新「本次开机见过它」
             st["note"] = "盯守中（第 %d 次确认它还在）" % st["rounds"]
             save_watch_state(st)
             return
@@ -5777,6 +5924,10 @@ class CountdownApp:
 
         无人值守时没人应答，倒计时走完照样寄出去 —— 默认是「寄」。
         这一句问话只在「有人恰好坐在机器前」时才起作用：他点一下就不寄了。
+
+        倒计时的每一分钟都是**核实过它确实还不在**的（watch_tick 的 pending
+        档每 30 秒看一眼）：这十分钟里它只要又出现过一次，问话窗就当场合掉。
+        所以「等满十分钟」等于「连续十分钟确认它不在」，不是闭着眼数。
         """
         try:
             minutes = int(float(self.watch_cfg().get("grace_min") or 10))
@@ -5842,7 +5993,8 @@ class CountdownApp:
             # 只有真实盯守才动状态机：退回 waiting，窗口下次出现自动接着盯。
             st = self.watch_state
             st.update({"pending": {}, "phase": "waiting", "seen_at": "",
-                       "rounds": 0, "last_probe": 0.0})
+                       "seen_boot": 0.0, "rounds": 0, "last_probe": 0.0,
+                       "pend_probe": 0.0})
             st["note"] = ("窗口消失，已寄信告知" if send
                           else "你确认是自己关的，没有寄信")
             save_watch_state(st)
@@ -5888,11 +6040,17 @@ class CountdownApp:
             "上次见到　%s" % (pend.get("seen_at") or "—"),
             "检查间隔　每 %d 分钟看一眼" % every,
         ]
+        if not drill:
+            # 这十分钟不是闭着眼数的：问话期间每 30 秒核实一次，确实一直
+            # 不在才走到寄信这一步。写进信里，收信的人才知道它有多确定。
+            lines.append("连续不见　%d 分钟（期间反复确认过）"
+                         % int(pend.get("minutes") or 10))
         sign = self.notify_signature()
         if sign:
             lines.append("寄出机器　%s" % sign)
         lines.append("（演练：真出这种事的时候，通知你的就是这封）" if drill
-                     else "（无人应答，按无人值守的约定自动寄出）")
+                     else "（连续 %d 分钟反复确认它不在，按无人值守的约定自动寄出）"
+                          % int(pend.get("minutes") or 10))
         lines += self.mail_footer()
         body = "\n".join(lines)
         if len(body.encode("utf-8")) > NOTIFY_BODY_LIMIT:
@@ -5964,8 +6122,8 @@ class CountdownApp:
                        - time.time())
             if left < 0:
                 left = 0
-            return "窗口不见了，问话窗还开着（还有 %d 分 %d 秒自动寄信）" \
-                % (left // 60, left % 60)
+            return "窗口不见了，问话窗还开着（还有 %d 分 %d 秒自动寄信，" \
+                   "它再出现就撤销）" % (left // 60, left % 60)
         return "等「%s」出现" % keyword
 
     # ---------------- 设置面板 ----------------
@@ -6956,16 +7114,19 @@ class SettingsPanel:
 
     def _build_shutdown(self, parent):
         """
-        定时关机：网址取日期 → 那就是**关机时刻** → 到点关机。
+        定时关机：网址取日期（或设置文件里写死时刻）→ 那就是**关机时刻**
+        → 到点关机。
 
-        两点是刻意这么写的：
+        三点是刻意这么写的：
 
         · 取回的时刻**只用来关机**，不动上面那个「目标时刻」。那是用户自己设的
           倒计时，跟「这台机器几点关」是两件事。早先的版本把两者合成一个，
           取一次日期就把用户的倒计时换掉了 —— 已经被指出来过一次，别再合并。
-        · 不给「关机时刻」单独放输入框：那个时刻的权威来源是网址，再给一个框
-          两处都能改，用户永远搞不清以哪个为准。想知道现在定的是几点，
+        · 不给「关机时刻」单独放输入框：那个时刻的权威来源是网址或设置文件，
+          再给一个框两处都能改，用户永远搞不清以哪个为准。想知道现在定的是几点，
           看下面那行「当前关机时刻」。
+        · 设置文件里写着关机时刻时，下面会多一行灰字说明它的来处 ——
+          用户没填网址却看见关机时刻，不至于以为程序出了错。
         """
         app, pal = self.app, self.pal
         sd = app.shutdown_cfg()
@@ -7079,6 +7240,17 @@ class SettingsPanel:
                                                anchor="w", justify="left"), 40)
         self.shut_at_lbl.pack(fill="x", pady=(8, 0))
 
+        # 关机时刻写在设置文件里时的那一行说明。只读 —— 那个时刻的权威是
+        # 远程设置 / 共用设置那份文件（和网址同一个道理：再给一个输入框，
+        # 两处都能改，用户永远搞不清以哪个为准）。要改去改那份配置文件。
+        # **刻意不在这里 pack**：没指定 at 时它一行都不占（面板内容高度是
+        # 卡着屏幕七成算的，多一行空Label就可能把滚动条顶出来）。
+        # 露不露面由 _sync_shutdown_note 按 cfg.shutdown.at 决定。
+        self.shut_src_lbl = self._wrap(tk.Label(wrap, text="", bg=pal["paper"],
+                                                fg=pal["ink_soft"],
+                                                font=(app.fam_cn, 9),
+                                                anchor="w", justify="left"), 40)
+
         self.shut_msg = self._wrap(tk.Label(wrap, text="", bg=pal["paper"],
                                             fg=pal["ink_soft"], font=(app.fam_cn, 9),
                                             anchor="w", justify="left"), 40)
@@ -7144,6 +7316,21 @@ class SettingsPanel:
             self.shut_at_lbl.configure(
                 text="　当前关机时刻：%s" % self.app.shutdown_left_text(),
                 fg=self.pal["seal"] if dt is not None else self.pal["ink_soft"])
+        # 关机时刻是设置文件里写死的时候，说清它从哪儿来 ——
+        # 否则用户没填网址却看见一个关机时刻，只会以为程序出了错。
+        # 没指定 at 时这行整个不占地方（pack_forget），面板高度不受影响。
+        if hasattr(self, "shut_src_lbl"):
+            at_text = ((self.app.cfg.get("shutdown") or {}).get("at") or "").strip()
+            if at_text:
+                self.shut_src_lbl.configure(
+                    text="　（这个时刻写在设置文件里，要改去改那份配置文件）")
+                if not self.shut_src_lbl.winfo_manager():
+                    # before= 钉住位置：它在「当前关机时刻」与「关机状态」之间。
+                    # 不钉的话 pack 会把它甩到这一节末尾（试一遍按钮后面）去。
+                    self.shut_src_lbl.pack(fill="x", pady=(2, 0),
+                                           before=self.shut_msg)
+            elif self.shut_src_lbl.winfo_manager():
+                self.shut_src_lbl.pack_forget()
         st = self.app.shutdown_state or {}
         phase = st.get("phase") or ""
         if phase == "asking":
@@ -7222,14 +7409,21 @@ class SettingsPanel:
             self.entry_url.delete(0, "end")
             self.entry_url.insert(0, url)
 
-        return {
+        # 从当前配置起手再改面板上能编辑的那几项 —— 和 _collect_remote 同一套路子。
+        # 关键是 **at 原样带回**：关机时刻的权威是设置文件（或网址），面板上
+        # 没有它的输入框（两处都能改，用户永远搞不清以哪个为准），保存时绝不能
+        # 把它冲掉。deep_merge 本来也保得住，这里显式写出来是为了别被将来
+        # 改合并逻辑的人悄悄弄丢。
+        cfg = dict(self.app.shutdown_cfg())
+        cfg.update({
             "enabled": bool(self.var_shut.get()),
             "from_target": bool(self.var_from_target.get()),
             "url": url,
             "auto_fetch": bool(self.var_auto_site.get()),
             "refresh_hours": hours,
             "grace_sec": grace,
-        }, None
+        })
+        return cfg, None
 
     def _build_thresholds(self, parent):
         app, pal = self.app, self.pal
@@ -7809,7 +8003,8 @@ class SettingsPanel:
 
     def _build_watch(self, parent):
         """
-        窗口盯守：挑一扇窗，定期看一眼它还在不在，不见了就寄信。
+        窗口盯守：挑一扇窗，定期看一眼它还在不在，**连续不见满设定的分钟数**
+        才寄信（那段时间里程序会反复核实，它一出现就自动撤销）。
 
         下拉框里放的是「此刻开着的窗口」，但真正存下来的是**关键字**。
         为什么不直接存整条标题：游戏标题里常带角色名、等级、在线人数，
@@ -7820,7 +8015,7 @@ class SettingsPanel:
         wc = app.watch_cfg()
 
         head = self._section("窗口盯守", parent)
-        tk.Label(head, text="不见了就发信问你", bg=pal["paper"], fg=pal["ink_soft"],
+        tk.Label(head, text="连续不见才寄信", bg=pal["paper"], fg=pal["ink_soft"],
                  font=(app.fam_cn, 9)).pack(side="right")
 
         wrap = tk.Frame(parent, bg=pal["paper"])
@@ -7907,7 +8102,8 @@ class SettingsPanel:
                  relief="flat", insertbackground=pal["seal"],
                  highlightthickness=1, highlightbackground=pal["border_soft"],
                  highlightcolor=pal["seal"]).pack(side="left", padx=(4, 4), ipady=3)
-        self._wrap(tk.Label(row4, text="分钟没人应答，就自动寄信（无人值守时走的就是这条路）",
+        self._wrap(tk.Label(row4, text="分钟。这十分钟里反复确认它确实不在，才寄信"
+                                        "（一出现就自动撤销）",
                             bg=pal["paper"], fg=pal["ink"],
                             font=(app.fam_cn, 10), anchor="w", justify="left"), 118).pack(
             side="left")
@@ -8062,10 +8258,10 @@ class SettingsPanel:
         try:
             grace = int(float(self.var_watch_grace.get().strip() or 10))
         except ValueError:
-            return None, "「等几分钟没人应答就发信」要填数字"
+            return None, "「连续不见几分钟才寄信」要填数字"
         if not WATCH_GRACE_MIN <= grace <= WATCH_GRACE_MAX:
-            return None, "「等几分钟」要在 %d ~ %d 之间" % (WATCH_GRACE_MIN,
-                                                         WATCH_GRACE_MAX)
+            return None, "「连续不见几分钟」要在 %d ~ %d 之间" % (WATCH_GRACE_MIN,
+                                                             WATCH_GRACE_MAX)
 
         title = self.entry_watch.get().strip()
         if self.var_watch.get() and not title:
@@ -8989,6 +9185,11 @@ class WatchAlertWindow:
         info = ["发现时间　%s" % (self.pend.get("at") or _stamp()),
                 "上次见到　%s" % (self.pend.get("seen_at") or "—"),
                 "检查间隔　每 %d 分钟看一眼" % int(self.pend.get("interval_min") or 30)]
+        if not self.drill:
+            # 真实盯守：这十分钟是「反复核实过它确实不在」的十分钟 ——
+            # 说清楚，用户才知道为什么值得等（以及它回来了会怎样）。
+            info.append("寄信条件　连续不见 %d 分钟（期间反复核实）"
+                        % int(self.pend.get("minutes") or 10))
         tk.Label(wrap, text="\n".join(info), bg=pal["paper"], fg=pal["ink_soft"],
                  font=(app.fam_cn, 9), anchor="w", justify="left").pack(fill="x",
                                                                        pady=(8, 0))
@@ -8999,7 +9200,8 @@ class WatchAlertWindow:
         tk.Label(wrap, text=("演练到此为止都还不用管它；倒计时走完会真发一封"
                              "标注为「演练」的信给你，验证寄信这条路通不通。"
                              if self.drill else
-                             "没人点下面那颗按钮的话，倒计时走完就自动寄信给你。"),
+                             "没人点下面那颗按钮的话，倒计时走完就自动寄信给你；"
+                             "这十分钟里它又出现，就当场撤销，不当它消失过。"),
                  bg=pal["paper"], fg=pal["ink"], font=(app.fam_cn, 10),
                  anchor="w", justify="left", wraplength=420).pack(fill="x", pady=(4, 0))
 
