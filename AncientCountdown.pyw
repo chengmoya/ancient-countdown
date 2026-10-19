@@ -50,7 +50,7 @@ APP_SUB = "ANCIENT COUNTDOWN"
 # 在线升级靠它判断「有没有新版」：两边都是 "主.次" 两段数字，
 # 比较时拆成 (1, 3) 这样的小元组比大小 —— 字符串比会出事，
 # "1.10" < "1.9" 在字符串世界里是成立的，那会让用户升不上去。
-APP_VERSION = "1.10"
+APP_VERSION = "1.10.2"
 
 MIN_W, MIN_H = 300, 150          # 窗口最小尺寸
 # 数字字号的下限。宁可让它稍微顶出一点，也不缩到看不清：
@@ -7608,9 +7608,24 @@ class SettingsPanel:
         cfg = self.app.remote_cfg()
         cfg["items"] = dict((k, bool(v)) for k, v in selection.items())
         self.app.cfg["remote"] = cfg
-        self._sync_remote_note()
-        self.remote_msg.configure(text="　已挑好；点「保存」后长期生效。",
-                                  fg=self.pal["ink_soft"])
+
+    def _remote_items_picked(self, selection):
+        """
+        挑完之后的收尾：把挑中了哪几项写在按钮下面。
+
+        存下结果和告诉用户是两件事，所以拆成两个方法（ExportPicker 先调
+        persist 再回调这一个）。这里非得把挑中的项名念一遍：小窗一关就再也
+        没有地方显示这套勾了，不写出来，过两天回来只能凭记忆猜当初挑了什么。
+        """
+        names = [it["label"] for it in remote_item_specs()
+                 if selection.get(it["key"])]
+        shown = "、".join(names)
+        if len(shown) > 60:                  # 十几项全勾时别把面板撑成一堵墙
+            shown = shown[:57] + "…"
+        self.remote_msg.configure(
+            text="　已挑好 %d 项（%s）；点「保存」后长期生效。"
+                 % (len(names), shown or "（无）"),
+            fg=self.pal["ink_soft"])
 
     def _build_window(self, parent):
         app, pal = self.app, self.pal
@@ -8790,6 +8805,15 @@ class SettingsPanel:
                 lambda m=err: self._update_stop("检查更新失败：" + str(m),
                                                 self.pal["seal"]))
             return
+        # 手动查到了也记一笔（版本号 + 时间戳）。不记的后果正是用户
+        # 实拍到的：v1.6 上手动看到 v1.10，程序一重启，按钮又倒退成
+        # 上次自动检查留下的「v1.9」——手动查的结果只活了当时那一会儿。
+        # 时间戳一起更新顺理成章：用户刚亲手查过，自动检查没必要
+        # 在 7 天内再查一遍。
+        try:
+            note_auto_check(info.get("version"))
+        except Exception as exc:          # noqa: BLE001
+            log_problem("手动检查更新", type(exc), exc, exc.__traceback__)
         if not update_available(info.get("version")):
             # 手动查到「已是最新」，顺手把右上角那颗小红点灭掉。
             # 必须经 _update_ui 回主线程 —— 这里跑在后台线程上，直接碰 canvas 会崩。
