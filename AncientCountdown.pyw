@@ -50,7 +50,7 @@ APP_SUB = "ANCIENT COUNTDOWN"
 # 在线升级靠它判断「有没有新版」：两边都是 "主.次" 两段数字，
 # 比较时拆成 (1, 3) 这样的小元组比大小 —— 字符串比会出事，
 # "1.10" < "1.9" 在字符串世界里是成立的，那会让用户升不上去。
-APP_VERSION = "1.10.2"
+APP_VERSION = "1.10.3"
 
 MIN_W, MIN_H = 300, 150          # 窗口最小尺寸
 # 数字字号的下限。宁可让它稍微顶出一点，也不缩到看不清：
@@ -74,7 +74,11 @@ CTRL_STEP_MIN = 30
 # 这样「演练实例」和「真正在用的实例」互不干扰，否则跑一次自检就会
 # 让真程序以为「已经有一个在跑了」，其实是它自己把门堵上。
 MUTEX_NAME = "Local\\AncientCountdown_SingleInstance"
-WAKE_FILE = "_wake.signal"       # 第二个实例留下的「请现身」信号
+# 「现身」信号（v1.10.3 起）：命名事件，替代以前的「信箱文件 + 每秒轮询」。
+# 和单实例锁同一个规矩 —— 名字带上数据目录的路径指纹（见 _instance_tag），
+# 这样「演练实例」和「真正在用的实例」各用各的内核对象，互不干扰。
+WAKE_EVENT_NAME = "Local\\AncientCountdown_Wake"
+WAKE_FILE = "_wake.signal"       # 旧版信箱文件名，仅留在 LEGACY_JUNK_FILES 里清残留
 
 # ---- 开机自动运行 ----
 # 写在 HKCU 的 Run 键里：只影响当前用户，不需要管理员权限，
@@ -515,6 +519,15 @@ def chrome_hidden(win):
         return False
 
 
+def _instance_tag():
+    """
+    数据目录的路径指纹：单实例锁与「现身」事件共用它当名字后缀。
+    正常使用时所有实例共用同一个目录，行为不变；演练（设了
+    ANCIENT_COUNTDOWN_HOME）则另起一套名字，不会把真程序挡在门外。
+    """
+    return hashlib.md5(os.path.abspath(DATA_DIR).lower().encode("utf-8")).hexdigest()[:12]
+
+
 def acquire_single_instance():
     """
     单实例锁。True = 本进程是唯一实例；False = 已经有实例在跑了。
@@ -530,8 +543,7 @@ def acquire_single_instance():
         # use_last_error=True：否则 CreateMutexW 之后读到的 last error
         # 可能已经被解释器内部的其它调用覆盖掉
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        tag = hashlib.md5(os.path.abspath(DATA_DIR).lower().encode("utf-8")).hexdigest()[:12]
-        handle = k32.CreateMutexW(None, False, "%s_%s" % (MUTEX_NAME, tag))
+        handle = k32.CreateMutexW(None, False, "%s_%s" % (MUTEX_NAME, _instance_tag()))
         if not handle:
             return True                      # 系统调用失败就放行，不要反过来卡住自己
         if ctypes.get_last_error() == 183:   # ERROR_ALREADY_EXISTS
@@ -541,15 +553,71 @@ def acquire_single_instance():
         return True
 
 
-def request_wake():
-    """请已有实例把窗口挪到可见处——用户双击，本意就是「我要看见它」。"""
-    ok, _ = reg_store_write("wake", {"pid": os.getpid()})
-    return ok
+def _wake_event_name():
+    return "%s_%s" % (WAKE_EVENT_NAME, _instance_tag())
 
 
-def clear_wake_file():
-    """清掉可能残留的唤醒信号，避免刚启动就自己触发一次「现身」。"""
-    reg_store_delete("wake")
+def create_wake_event(name=None):
+    """
+    建「现身」命名事件（自动复位、初始未发信）。返回内核句柄；失败返回 None。
+
+    为什么用命名事件而不是信箱文件：第二个实例是**另一个进程**，
+    它没法写第一个进程的内存，只能借操作系统共享的对象传话。命名事件
+    和旁边的单实例锁是一家人（都是内核对象）：零轮询、进程被强杀时
+    由系统回收，不会留下假状态。
+    """
+    try:
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # 句柄是指针宽的：64 位下不设 restype 会被截断成 32 位，
+        # 后面 WaitForSingleObject/SetEvent 拿着残句柄必然出错。
+        k32.CreateEventW.restype = ctypes.c_void_p
+        k32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_bool,
+                                     ctypes.c_bool, ctypes.c_wchar_p]
+        handle = k32.CreateEventW(None, False, False, name or _wake_event_name())
+        return handle or None
+    except Exception:
+        return None
+
+
+def signal_wake(name=None, timeout=2.0):
+    """
+    第二个实例用：给已在跑的实例发「现身」信号。成功返回 True。
+
+    带重试：第一个实例刚拿到单实例锁、事件还没建好的那一瞬，
+    OpenEvent 会扑空。重试几秒足够覆盖（建事件就在拿锁后没几行）。
+    """
+    import time
+    try:
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenEventW.restype = ctypes.c_void_p
+        k32.OpenEventW.argtypes = [ctypes.c_uint32, ctypes.c_bool, ctypes.c_wchar_p]
+        k32.SetEvent.argtypes = [ctypes.c_void_p]
+        k32.SetEvent.restype = ctypes.c_bool
+    except Exception:
+        return False
+    deadline = time.time() + timeout
+    while True:
+        try:
+            handle = k32.OpenEventW(0x0002, False, name or _wake_event_name())
+            if handle:
+                k32.SetEvent(handle)
+                return True
+        except Exception:
+            return False
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def clear_legacy_wake_file():
+    """清掉旧版（v1.10.2 及以前）留下的 wake.json —— 新版改用命名事件，
+    这个信箱文件再也不读了，留着只是垃圾。"""
+    try:
+        os.remove(_mailbox_path("wake"))
+    except OSError:
+        pass
 
 
 def script_home():
@@ -662,7 +730,7 @@ MAILER_PATH = os.path.join(APP_DIR, MAILER_FILE)
 # 改一处 → 写回全文」，后写的会把先写的整段盖掉。表现是「设置改完过一会儿
 # 自己变回去了」，极难查。拆开之后主文件永远只有主进程一个人写，
 # 物理上不可能互相覆盖。
-MAILBOX_NAMES = ("notify_task", "notify_result", "notify_test_result", "wake")
+MAILBOX_NAMES = ("notify_task", "notify_result", "notify_test_result")
 
 # 主文件的内存副本。只有主进程会写主文件，所以缓存绝对安全；
 # 而 tick 每秒都要看一眼唤醒信号（那走信箱），每回都读盘太浪费。
@@ -3401,6 +3469,10 @@ def save_alert_state(st):
 class CountdownApp:
 
     def __init__(self):
+        # 「现身」命名事件：第二个实例双击时靠它把本窗口喊出来。
+        # 建得越早越好 —— 单实例锁在 main() 里就拿到了，事件紧随其后建好，
+        # 第二个进程发信号时几乎不可能扑空（发信那侧还有重试兜底）。
+        self._wake_event = create_wake_event()
         self.cfg = load_config()
         self.target, self.parse_err = parse_target(self.cfg.get("target"))
 
@@ -3500,6 +3572,9 @@ class CountdownApp:
         pal = self.cfg["palette"]
         self.root.configure(bg=pal["ink"])
         self.root.attributes("-topmost", bool(self.cfg.get("always_on_top", True)))
+
+        # 起守护线程等「现身」信号（root 已就绪，线程里要用它派活回主线程）
+        self._start_wake_waiter()
 
         self.canvas = tk.Canvas(self.root, highlightthickness=0, bd=0,
                                 bg=pal["paper"], cursor="fleur")
@@ -4231,15 +4306,6 @@ class CountdownApp:
         """
         now = datetime.datetime.now()
 
-        # 顺带看一眼有没有第二个实例在喊「现身」（一次注册表读，开销可忽略）。
-        # 这里也单独兜住：抛出去就是整条 tick 链断掉，代价是「倒计时不动 +
-        # 到点不关机」—— 为了一个顺带动作赔上主功能，完全不值。
-        if reg_store_read("wake", None) is not None:
-            try:
-                self._consume_wake()
-            except Exception as exc:              # noqa: BLE001
-                log_problem("唤醒", type(exc), exc, exc.__traceback__)
-
         # 传书巡检。每 30 秒才真跑一次 —— 中间那些秒只是一次减法比较，
         # 在纳秒量级，实测不出与改造前的差别。
         # 首次 tick 必然触发，相当于开机时补做一次「错过的提醒」。
@@ -4624,9 +4690,41 @@ class CountdownApp:
             return
         self._restore_chrome()
 
+    def _start_wake_waiter(self):
+        """
+        起一个守护线程，阻塞等「现身」事件（v1.10.3 起替代每秒读信箱文件）。
+
+        线程醒来后**不直接碰界面** —— Tk 非线程安全，一律用 root.after
+        把活派回主线程（和联网那几路一个规矩，见 _site_fetch/_remote_fetch
+        的 work()）。阻塞等待不占 CPU、不碰磁盘，正合这程序
+        「空闲 CPU≈0」的立身之本。
+        """
+        import threading
+        if not self._wake_event:
+            return                      # 建事件失败就安静退化为「不响应双击唤醒」
+        handle = self._wake_event
+
+        def work():
+            import ctypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            k32.WaitForSingleObject.restype = ctypes.c_uint32
+            while True:
+                try:
+                    rc = k32.WaitForSingleObject(handle, 0xFFFFFFFF)   # INFINITE
+                except Exception:
+                    return
+                if rc != 0:             # 非 WAIT_OBJECT_0：句柄坏了之类，别再转圈
+                    return
+                try:
+                    self.root.after(0, self._consume_wake)
+                except tk.TclError:
+                    return              # 程序正在退出，不用落地了
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _consume_wake(self):
         """另一个实例被启动了：用户想看见窗口，那就把自己挪回可见处。"""
-        clear_wake_file()
         self.reset_position()
 
     def toggle_lock(self):
@@ -9405,10 +9503,10 @@ def main():
             pass
         else:
             # 已经有实例在跑：不再开新进程（每个进程要占几十 MB），
-            # 而是让已有窗口显出来——用户双击就是想看见它
-            request_wake()
+            # 而是给已有实例发个「现身」信号——用户双击就是想看见它
+            signal_wake()
             return
-    clear_wake_file()
+    clear_legacy_wake_file()
     # 旧 exe（.old）不在这儿清了：它现在是「新版本连续稳定启动满几次」才删，
     # 触发点挂在窗口起来 60 秒之后（见 note_successful_run / _note_run_ok）。
     migrate_legacy_files()   # 老数据（注册表 / exe 旁边的旧 json）搬进新配置文件（一次性）
