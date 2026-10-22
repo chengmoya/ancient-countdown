@@ -50,7 +50,7 @@ APP_SUB = "ANCIENT COUNTDOWN"
 # 在线升级靠它判断「有没有新版」：两边都是 "主.次" 两段数字，
 # 比较时拆成 (1, 3) 这样的小元组比大小 —— 字符串比会出事，
 # "1.10" < "1.9" 在字符串世界里是成立的，那会让用户升不上去。
-APP_VERSION = "1.10.3"
+APP_VERSION = "1.11.0"
 
 MIN_W, MIN_H = 300, 150          # 窗口最小尺寸
 # 数字字号的下限。宁可让它稍微顶出一点，也不缩到看不清：
@@ -187,33 +187,35 @@ UPDATE_GUARD_KEY = "update_guard"        # 更新后的成功启动计数（v1.8
 UPDATE_GUARD_RUNS = 3                    # 稳定启动满几次才把 .old 删掉
 UPDATE_GUARD_DELAY_MS = 60 * 1000        # 启动后满多久才算「这一次启动成功了」
 
-# ---- 定时关机 · 取日期 / 到点执行 ----
+# ---- 定时关机 · 到点执行 ----
 #
-# 场景：机器上挂着游戏，什么时候收工不取决于人，而取决于用户自己网站上
-# 那一串日期数字（他那边随时会改）。所以那个网址是时间的权威来源，
-# 程序只负责把它取回来、解析成时刻、到点把机器关掉。
+# 场景：机器上挂着游戏，什么时候收工不取决于人，而取决于用户手上那份
+# 配置文件里的一个时刻（他那边随时会改）。所以那份文件是时间的权威来源 ——
+# 程序只负责把它（经远程设置）取回来、排上、到点把机器关掉。
 #
 # 第二个来源是**倒计时目标本身**：本机自己设的日子到了也关（from_target）。
 # 两个来源各算各的时刻，**谁先到谁关**；到点之后先弹窗问一句，没人理才真关。
 #
-# 为什么不用 Windows 自带的「计划任务」那条路：网站的日期随时会变，
-# 变了就得重排一次计划；程序自己倒计时、自己到点动手，改一次网址就行。
-SITE_STATE_KEY = "site_date"             # 最近一次取回的结果（给人看的）
+# 为什么不用 Windows 自带的「计划任务」那条路：配置里的日期随时会变，
+# 变了就得重排一次计划；程序自己倒计时、自己到点动手，改一次配置文件就行。
 SHUTDOWN_STATE_KEY = "shutdown_state"    # 关机是否已经触发 / 已错过
-SITE_FETCH_TIMEOUT = 12                  # 取一次最多等几秒
-SITE_FETCH_START_DELAY = 20              # 启动后静置多少秒才去取第一次
-SITE_MAX_BYTES = 64 * 1024               # 日期数字不可能超过这个数，防异常响应
-SITE_RAW_KEEP = 400                      # 原文只留这么多字给人核对
+# 老版本（≤ v1.10.x）「从网址取回关机时刻」留下的记录。v1.11 拆掉了那条路，
+# 这个键只剩一个用处：升级后把里面记着的**未来**时刻固化成 shutdown.at，
+# 免得那台机器升级完就再也不关了（见 _migrate_site_date_to_at）。
+LEGACY_SITE_STATE_KEY = "site_date"
 SHUTDOWN_GRACE_DEFAULT = 60              # 确认窗等你多少秒（不点就执行）
 SHUTDOWN_GRACE_MAX = 600                 # 最长十分钟 —— 再长就不叫「到点关机」了
 SHUTDOWN_RETRY_SEC = 60                  # 命令发出去了机器却没关成，隔多久再试一次
 # 关机时刻的两个来源。两个都算数时取**先到的那个**：
-#   remote  从用户自己的网址取回来的时刻
+#   remote  远程设置那份文件里写的 shutdown.at
 #   target  用户自己设的倒计时目标（归零那一刻）
-# 为什么保留两个：网址那个是「那边说了算」的收工时间；倒计时那个是
+# 为什么保留两个：remote 那个是「那边说了算」的收工时间；倒计时那个是
 # 「我这台机器自己该关的时候」。谁先到谁关，才符合两边各自的用途。
-SHUTDOWN_SOURCES = (("remote", "网址取回"),
+SHUTDOWN_SOURCES = (("remote", "远程设置"),
                     ("target", "倒计时目标"))
+# 远程设置：启动后静置多少秒才拉第一次。留给窗口本身，也避开「刚开机网络栈
+# 还没起来」那一段 —— 那会儿去拉必然失败，只会在面板上白记一笔失败。
+REMOTE_FETCH_START_DELAY = 20
 
 # ---- 窗口盯守 ----
 #
@@ -334,32 +336,29 @@ DEFAULT_CONFIG = {
     },
 
     # 定时关机：两个时刻来源，**谁先到谁关**。
-    #   remote  你那个网址上的一串日期数字，取回来的那一刻就是关机时刻
+    #   remote  远程设置那份文件里的 shutdown.at（下面 at 那一项）
     #   target  上面那个倒计时目标，归零那一刻也是关机时刻（from_target 控制）
     #
     # ⚠️ 两个时刻仍然是**两个各自独立的变量**，谁也不改写谁：
-    #   去网址取一次数，绝不会动 cfg["target"]（v1.6 就是那么错的，用户当场指出）。
+    #   远程设置带回一个时刻，绝不会动 cfg["target"]（v1.6 就是那么错的，用户当场指出）。
     #   现在只是「谁先到就按谁关」，不是把它们合成一个。
-    #   合并的后果是：用户设的倒计时会被一次取数悄悄换掉 —— 别再退回去。
+    #   合并的后果是：用户设的倒计时会被一份配置文件悄悄换掉 —— 别再退回去。
     #
     # 默认关着 —— 这是会「自己把电脑关掉」的功能，必须用户亲口说要。
     "shutdown": {
         "enabled": False,
         "from_target": True,        # 倒计时归零也关机（默认开：用户明确要的）
-        "url": "",                  # 你那个网站的地址，返回一串日期数字
-        "auto_fetch": True,         # 启动时自动取一次
-        "refresh_hours": 6.0,       # 之后每隔几小时再取一次（0 = 不再自动取）
         "grace_sec": SHUTDOWN_GRACE_DEFAULT,   # 确认窗等你几秒
-        # 关机时刻的**另一个指定来处**：设置文件里直接写死一个时刻。
+        # 关机时刻的**唯一外部来源**：设置文件里直接写一个时刻。
         # 远程设置 / 共用设置那份文件带上这一项，各台机器取回来就是关机时刻 ——
         # 用户只维护一份配置文件（远程设置本来就会定时下载），不必再单独
-        # 维护一个「返回日期数字的网址」。写法同 target（如 "2026.10.20.18.00"），
-        # 留空 = 没指定；写 "" 可以撤掉。
+        # 维护一个「返回日期数字的网址」（那条路 v1.11 已经拆掉）。
+        # 写法同 target（如 "2026.10.20.18.00"），留空 = 没指定；
+        # 写 "" 可以撤掉（远程设置那条路上空串同样算「撤掉」）。
         #
-        # 它和 url 那条喂的是**同一个变量** self.shutdown_at（来源都记 "remote"）：
-        #   · 运行期内谁后到谁算数（网址取到新值会当场覆盖，远程设置拉回来也会）；
-        #   · 重启后以这份文件里的值为准（见 _restore_shutdown_at）——
-        #     文件是用户此刻明确写下的值，site_date 只是「上次网址取到了什么」。
+        # 它喂的是 self.shutdown_at（来源记 "remote"）：
+        #   · 远程设置拉回来 → apply 落盘 → reload_from_store → 见 _restore_shutdown_at；
+        #   · 重启后以这份文件里的值为准。
         # ⚠️ 它同样绝不碰 cfg["target"]：主界面那个倒计时各机器各自设，
         #    这是用户点名划的线（见自检里「主界面倒计时目标没被改掉」那几条）。
         "at": "",
@@ -369,7 +368,7 @@ DEFAULT_CONFIG = {
     # 同样默认关着 —— 它会弹窗、会发信，得用户自己开。
     "watch": {
         "enabled": False,
-        "title": "",                # 要盯的窗口名称（关键字，短一点更稳）
+        "title": "",                # 要盯的窗口**类名**（键名沿袭旧版：老配置里存的是标题）
         "interval_min": 30,         # 多久看一眼（分钟）
         "grace_min": 10,            # 连续不见多少分钟才寄信（期间反复核实，它一出现就撤销）
         # 「窗口下次出现时自动接着盯」是**写死的行为**，没有开关：
@@ -958,6 +957,11 @@ def unseal_text(text):
 REG_STORE_ROOT = r"Software\AncientCountdown"
 
 # 注册表里那些值名，和文件里的键名一一对应（一个都不能漏，漏了就丢数据）
+#
+# site_date 留在这里只是**为了搬得出来**：v1.11 拆掉了「从网址取关机时刻」，
+# 但那台机器上最后一次取到的结果还得让它进数据文件，好让
+# _migrate_site_date_to_at 把未来时刻固化成 shutdown.at（否则升级完
+# 关机时刻凭空消失）。新代码不再往这个键里写。
 REGISTRY_ITEMS = ("config", "notify_secret", "notify_state", "site_date",
                   "shutdown_state", "watch_state", "alert_state",
                   "update_check", "update_guard", "shared_last",
@@ -1144,9 +1148,11 @@ def reset_factory_data():
 # 共用设置 · 多台机器同步同一份配置
 #
 # 一份文件搬来搬去，规矩只有三条：
-#   ① 文件放 exe 旁边，启动时读进去（读到就吃，吃完就删）
+#   ① 导入只走设置面板里「从文件导入…」—— 什么时候导、导哪一份，
+#      都由用户当场决定；文件永不自动被吃、也不会被删（那是母本）
 #   ② 本机抬头与开机自启**永不**被这份文件改掉 —— 它们天生各机不同
-#   ③ 文件里带着邮箱授权码（明文），所以它和密钥同级看待，绝不入库
+#   ③ 文件里可能带着邮箱授权码、远程设置的密码（明文），所以它和密钥同级
+#      看待，绝不入库；要发公开场合就导出时勾「敏感信息脱敏」
 #
 # 为什么不做成「常驻的配置文件」而是「读一次就销毁」：
 # 常驻的话，用户在界面上改的设置下一次启动就被文件盖回去，会显得
@@ -1163,10 +1169,19 @@ SHARED_NOTE = (
     "  没带的那些，对方机器上原来的设置会原样保留，不会被这里覆盖。\n"
     "· 本机抬头（寄信署名）不在这个文件里，每台机器各自设。\n"
     "· 开机自启也不在里面，那是每台机器自己的事。\n"
-    "· 文件里可能有邮箱授权码，是明文。别放进公共网盘、别发到群里。\n"
+    "· 文件里可能有邮箱授权码、远程设置的密码与令牌，是明文。\n"
+    "  别放进公共网盘、别发到群里；要发布到公开场合，请在导出时勾选\n"
+    "  「敏感信息脱敏」—— 那些凭据会变成 ***，看到它的机器保留自己的。\n"
     "· 想改内容就用记事本改（存成 UTF-8），再拷给别的机器。改坏了程序会\n"
     "  拒绝读入，并且故意不删文件，方便你改回来。"
 )
+
+# 脱敏导出时，凭据的统一替身。
+# 为什么要有个固定值而不是留空：空串在 JSON 里和「这项没设」分不开，
+# 而脱敏的本意是「这项有值但我不给你看」—— 留空会让导入端也什么都不做，
+# 结果和没导这项一模一样，用户在导入端看不出任何差别。
+# 导入端见到 *** 就当这项没有：本机原来存的是什么就还是什么。
+SHARED_MASK = "***"
 
 
 # 导出时可以一项一项挑 —— 见 build_shared_bundle 的 selection 参数。
@@ -1207,9 +1222,16 @@ SHARED_ITEMS = (
      "hint": "默认不带：能改这一项的文件，等于能决定你的授权码发到哪台服务器",
      "drop": (("config", "notify", "host"), ("config", "notify", "port"),
               ("config", "notify", "use_ssl"), ("config", "notify", "provider"))},
-    {"key": "shutdown", "label": "定时关机（网址与关机时刻）", "default": True,
-     "hint": "各机器的网址或关机时刻不一样的话就别带这一项",
+    {"key": "shutdown", "label": "定时关机（关机时刻与开关）", "default": True,
+     "hint": "各机器的关机时刻不一样的话就别带这一项",
      "drop": (("config", "shutdown"),)},
+    # 远程设置：以前它压根不出现在这张清单里 —— 段虽然因为「没在表里的键
+    # 照常带走」而默认跟着走，但用户在界面上看不见、也没法不勾它。
+    # 而它恰恰是最该让用户自己拿主意的一项：网址与认证方式搬过去，
+    # 那台机器下次就从同一个地方取配置了。
+    {"key": "remote", "label": "远程设置", "default": True,
+     "hint": "从哪个网址取设置、认证方式、隔多久取一次（认证密码与令牌随「邮箱授权码」那一项走）",
+     "drop": (("config", "remote"),)},
     {"key": "watch", "label": "窗口盯守设置", "default": True,
      "hint": "盯哪扇窗、隔多久看一次、连续不见多久才寄信",
      "drop": (("config", "watch"),)},
@@ -1277,7 +1299,7 @@ def shared_file_path():
     return os.path.join(DATA_DIR, SHARED_FILE)
 
 
-def build_shared_bundle(cfg, secret, selection=None):
+def build_shared_bundle(cfg, secret, selection=None, masked=False):
     """
     攒出「可以搬去别的机器」的那部分设置。
 
@@ -1286,9 +1308,14 @@ def build_shared_bundle(cfg, secret, selection=None):
       · 传了就按勾选项剔除 —— 没勾的项根本不进文件，
         也就不可能覆盖对方机器上那一项。
 
+    masked=True = 脱敏导出：凭据段（邮箱授权码、远程设置的密码/令牌/请求头）
+    一律写成 ***。给「这份文件要发布到公开场合」用 —— 网盘链接、群里、
+    公开仓库，落到谁手里都无所谓。导入的机器见到 *** 会保留自己原来那份。
+
     搬什么、不搬什么，是这段逻辑最要紧的地方：
 
       搬：目标时刻、颜色规则、配色、传书设置（服务商/账号/收件人/档位）、
+          远程设置（网址/认证方式/刷新间隔）、定时关机（含 shutdown.at）、窗口盯守、
           锁定与置顶、窗口大小与位置（具体带哪几项由 selection 定）。
       不搬 notify.signature（本机抬头）—— 各台机器刻意不同，搬过去会把
           对方的抬头冲掉，而抬头恰恰是用户唯一想区分开的东西。
@@ -1300,10 +1327,22 @@ def build_shared_bundle(cfg, secret, selection=None):
     """
     snap = json.loads(json.dumps(cfg or {}))       # 深拷贝，绝不改调用方的对象
     snap.pop("autostart", None)
+    # 面板尺寸必须剔掉（2026-10-22 修）：以前它只是不在 SHARED_ITEMS 里，
+    # 而这张表是**剔除式**的（没在表里的键照常带走），所以它其实一直跟着
+    # 共用设置跑到别的机器上 —— 小屏机器上设置面板会被撑出屏幕，用户连
+    # 「✕」都点不到。注释里写的「不会碰它」一直是错的，这里把实现补上。
+    snap.pop("panel", None)
     nd = snap.get("notify")
     if isinstance(nd, dict):
         nd.pop("signature", None)
     sec = secret if isinstance(secret, dict) else {}
+    # 凭据段按 SECRET_FIELDS 全量导出：以前只带 smtp_password，远程设置的
+    # 密码/令牌/请求头白白留在本机 —— 用户把配置导去新机器，寄信能用、
+    # 远程取设置却要重填一遍密码。现在五项一起走，脱敏导出时统一打码。
+    if masked:
+        notify_secret = dict((k, SHARED_MASK) for k in SECRET_FIELDS)
+    else:
+        notify_secret = dict((k, sec.get(k) or "") for k in SECRET_FIELDS)
     bundle = {
         "_说明": SHARED_NOTE,
         "schema": SHARED_SCHEMA,
@@ -1311,7 +1350,8 @@ def build_shared_bundle(cfg, secret, selection=None):
         "version": APP_VERSION,
         "exported_at": _stamp(),
         "config": snap,
-        "notify_secret": {"smtp_password": sec.get("smtp_password") or ""},
+        "notify_secret": notify_secret,
+        "masked": bool(masked),
     }
     if selection is not None:
         picked = set(k for k in shared_item_keys() if selection.get(k))
@@ -1430,6 +1470,10 @@ def apply_shared_config(bundle):
     # 双保险：导出时不写抬头和自启，导入时也不认 —— 就算有人手工往文件里
     # 加了这两项，也顶不掉本机的抬头、也不会关掉本机的自启。
     cfg_in.pop("autostart", None)
+    # 面板尺寸同理（2026-10-22）：老版本导出的文件里带着这一项，不剔的话
+    # 手工编辑过的文件照样能把小屏机器上的面板撑出屏幕。只在 close() 且
+    # 真拖过尺寸时才落盘，所以各机的值本来就该各管各的。
+    cfg_in.pop("panel", None)
     nd = cfg_in.get("notify")
     if isinstance(nd, dict):
         nd.pop("signature", None)
@@ -1454,24 +1498,41 @@ def apply_shared_config(bundle):
         return False, "设置写不进注册表：%s" % err
 
     sec_in = bundle.get("notify_secret")
-    if isinstance(sec_in, dict) and (sec_in.get("smtp_password") or "").strip():
-        cur_sec = reg_store_read("notify_secret", {"smtp_password": ""})
-        if not isinstance(cur_sec, dict):
-            cur_sec = {"smtp_password": ""}
-        cur_sec["smtp_password"] = sec_in["smtp_password"]
-        ok2, err2 = reg_store_write("notify_secret", cur_sec)
-        if not ok2:
-            return False, "授权码写不进注册表：%s" % err2
+    if isinstance(sec_in, dict):
+        # 必须走 load_notify_secret 拿**明文形态**：reg_store_read 读出来的是
+        # 磁盘态（密文），在它上面改再 seal，没被这次导入覆盖的字段会被
+        # 双层加密 —— 下次只解一层，读出来是一半密文，等于把凭据写坏了。
+        cur_sec = load_notify_secret()
+        touched = False
+        for name in SECRET_FIELDS:
+            val = sec_in.get(name)
+            # 空串和 *** 都当「这项没有」：本机原来存的是什么就还是什么。
+            # 前者是用户本来就没设，后者是脱敏导出的占位符。
+            if not isinstance(val, str) or not val.strip() or val == SHARED_MASK:
+                continue
+            cur_sec[name] = val
+            touched = True
+        if touched:
+            # 落盘前必须加密：凭据段在磁盘上只能是密文（和 save_notify_secret
+            # 同一道手续）。以前这里是原样写进去的 —— 从共用设置文件导入授权码
+            # 之后，数据文件里会白白躺着一份明文，直到用户下次在面板上保存。
+            # 顺带把段里可能存在的其他键原样带着走（加密只认 SECRET_FIELDS）。
+            sealed = dict((k, seal_text(v) if k in SECRET_FIELDS else v)
+                          for k, v in cur_sec.items())
+            ok2, err2 = reg_store_write("notify_secret", sealed)
+            if not ok2:
+                return False, "授权码写不进注册表：%s" % err2
     return True, ""
 
 
-def export_shared_config(path, cfg, secret, selection=None):
+def export_shared_config(path, cfg, secret, selection=None, masked=False):
     """
     把当前设置写成一份共用设置文件。返回 (True, None) 或 (False, 失败原因)。
 
     selection 见 build_shared_bundle；None = 全带。
+    masked=True = 脱敏导出（凭据打码，可安全发布），见 build_shared_bundle。
     """
-    bundle = build_shared_bundle(cfg, secret, selection)
+    bundle = build_shared_bundle(cfg, secret, selection, masked=masked)
     text = json.dumps(bundle, ensure_ascii=False, indent=2) + "\n"
     try:
         # 带 BOM 写：用户多半会拿记事本打开看一眼，老记事本见到没 BOM 的
@@ -1547,11 +1608,15 @@ def remote_item_specs():
     """
     远程同步能勾哪些项：和「导出共用设置」共用同一张表。
 
-    唯一去掉的是「邮箱授权码」那一项 —— 密码永远不从网上取，只在本机填。
-    这条不能通融：远端那个文件是放在某个网址上的，
-    谁改得动它，谁就相当于指定了「你的授权码往哪个服务器发」。
+    去掉的两项，理由各不相同但都硬：
+      ·「邮箱授权码」—— 密码永远不从网上取，只在本机填。远端那个文件放在
+        某个网址上，谁改得动它，谁就相当于指定了「你的授权码往哪个服务器发」。
+      ·「远程设置」—— 远端绝不能改写本机的「下次去哪儿取配置、拿什么认证」。
+        这一项在 U 盘导入那条路上是有的（文件是用户自己拷的，他明知故带），
+        但从网址拉回来的那份不行；apply_remote_config 本来就会把 config.remote
+        整个 pop 掉，这里再放进清单只会造成「勾了也没用」的困惑。
     """
-    return [it for it in SHARED_ITEMS if it["key"] != "secret"]
+    return [it for it in SHARED_ITEMS if it["key"] not in ("secret", "remote")]
 
 
 def default_remote_selection():
@@ -1638,6 +1703,7 @@ def apply_remote_config(bundle, items=None):
 
     cfg_in = json.loads(json.dumps(cfg_in))
     cfg_in.pop("autostart", None)
+    cfg_in.pop("panel", None)      # 面板尺寸各机各管各的，见 apply_shared_config
     nd = cfg_in.get("notify")
     if isinstance(nd, dict):
         nd.pop("signature", None)
@@ -3008,129 +3074,7 @@ def pick_theme(remaining_seconds, cfg):
             "bg_explicit": False, "label": ""}
 
 
-# --------------------------------------------------------------------------
-# 主窗口
-# --------------------------------------------------------------------------
 
-# --------------------------------------------------------------------------
-# 定时关机 · 从自己的网站取日期数字
-# --------------------------------------------------------------------------
-#
-# 这一节只做三件事：把网址上的内容读成一个时刻、把时刻写回配置、到点执行关机。
-# 联网与开机关机的动作都放在独立进程 / 后台线程里（见 app.fetch_site_now），
-# 主进程只做「时间到了没有」这种减法 —— 和传书那一套是同一个思路。
-
-def _walk_scalars(node, depth=0):
-    """把一个 JSON 结构里所有标量值摊平（含嵌套的字典与数组）。"""
-    if depth > 6:
-        return
-    if isinstance(node, dict):
-        for value in node.values():
-            for item in _walk_scalars(value, depth + 1):
-                yield item
-    elif isinstance(node, (list, tuple)):
-        for value in node:
-            for item in _walk_scalars(value, depth + 1):
-                yield item
-    elif isinstance(node, (str, int, float)):
-        yield node
-
-
-def _compact_digits_dt(text):
-    """
-    把光秃秃的一串数字读成时刻：20261001 / 202610011130 / 20261001113000。
-
-    「一串日期数字」最省事的形式就是把年月日时分直接连起来，中间一个标点都不给。
-    这种写法 parse_target 读不通（它把整串当成一个数字，只好拒绝），所以单独认一下。
-
-    开头必须是 19 / 20：这样 1759041000 这类时间戳不会被猜成 1975 年 9 月 ——
-    猜错的日子比读不通更坏，读不通至少还能报个「没找到日期」。
-    """
-    s = str(text or "").strip()
-    if not s.isdigit() or len(s) not in (8, 10, 12, 14):
-        return None
-    if s[:2] not in ("19", "20"):
-        return None
-    try:
-        return datetime.datetime(
-            int(s[0:4]), int(s[4:6]), int(s[6:8]),
-            int(s[8:10]) if len(s) >= 10 else 0,
-            int(s[10:12]) if len(s) >= 12 else 0,
-            int(s[12:14]) if len(s) >= 14 else 0)
-    except ValueError:
-        return None
-
-
-def _epoch_dt(text):
-    """10 位（秒）/ 13 位（毫秒）时间戳。认不出返回 None。"""
-    s = str(text or "").strip()
-    if not s.isdigit() or len(s) not in (10, 13):
-        return None
-    try:
-        value = int(s)
-        if len(s) == 13:
-            value //= 1000
-        if not 946684800 <= value <= 4102444800:      # 2000-01-01 ~ 2100-01-01
-            return None
-        return datetime.datetime.fromtimestamp(value)
-    except (ValueError, OSError, OverflowError):
-        return None
-
-
-def extract_target(raw, now=None):
-    """
-    从网站返回的内容里挖出一个能认的时刻。返回 (datetime | None, 认到的原文)。
-
-    为什么要这么宽容：那个网站是用户自己写的，返回什么谁也说不准 ——
-    可能是一句纯日期数字，可能是 JSON 里的某个字段，也可能是一段带标签的网页。
-    与其让他去对齐一个约定，不如这边把常见形式全认下来：
-
-        ① 整段就是一个日期数字（"10.1.11.30"、"2026-10-01 11:30"）
-        ② 年月日连成一串（"202610011130"）
-        ③ 时间戳（10 位秒 / 13 位毫秒）
-        ④ JSON：把所有字段值摊平，一个个试
-        ⑤ 带标签 / 带引号的文本：抠出像日期的小段再试
-
-    认不出来就明说认不出来，绝不猜 —— 猜出一个看着合理的错时间，
-    用户要到倒计时归零、机器真关了才发现。
-    """
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8", "ignore")
-    text = str(raw or "").strip()
-    if not text:
-        return None, ""
-
-    def attempt(cand):
-        cand = str(cand).strip()
-        if not cand:
-            return None
-        got, _err = parse_target(cand, now=now)
-        if got is not None:
-            return got
-        return _compact_digits_dt(cand) or _epoch_dt(cand)
-
-    cands = [text]
-    try:
-        data = json.loads(text)
-    except ValueError:
-        data = None
-    if data is not None:
-        cands.extend(str(v) for v in _walk_scalars(data))
-    # 带标签的文本：去掉标签后，抠出「数字开头 + 数字/日期符号」的小段。
-    # 这一段不含空格 —— 含空格的话，整行说明文字都会被当成一个候选。
-    flat = re.sub(r"<[^>]*>", " ", text)
-    cands.extend(re.findall(r"\d[\d.\-/年月日时分:：]{0,24}", flat))
-
-    seen = set()
-    for cand in cands:
-        key = cand.strip()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        got = attempt(key)
-        if got is not None:
-            return got, key[:60]
-    return None, ""
 
 
 def canonical_target(dt):
@@ -3179,30 +3123,6 @@ def extend_target_text(text, days=30, now=None):
     got, _err = parse_target(text, now)
     base = got if (got is not None and got > now) else now
     return target_text_of(base + datetime.timedelta(days=days))
-
-
-def fetch_site_target(url, timeout=SITE_FETCH_TIMEOUT, now=None):
-    """
-    去用户自己的网站取那一串日期数字。
-
-    返回 (datetime, 认到的原文, None) 或 (None, 收到的原文, 错误说明)。
-
-    只认 http / https；网址少了协议头就补 http:// —— 用户十有八九只写域名。
-    """
-    url = (url or "").strip()
-    if not url:
-        return None, "", "还没填网址"
-    if not re.match(r"^https?://", url, re.I):
-        url = "http://" + url
-    data, err = _http_get(url, timeout=timeout, max_bytes=SITE_MAX_BYTES)
-    if data is None:
-        return None, "", err
-    text = data.decode("utf-8", "ignore")
-    got, used = extract_target(text, now=now)
-    if got is None:
-        brief = re.sub(r"\s+", " ", text).strip()[:120]
-        return None, text, "返回内容里没找到能认的日期数字（收到的是：%s）" % (brief or "空内容")
-    return got, used, None
 
 
 def shutdown_key_of(source, dt):
@@ -3303,13 +3223,16 @@ def save_shutdown_state(st):
 # 窗口盯守 · 看某扇窗还在不在
 # --------------------------------------------------------------------------
 #
-# 「在不在」这件事只能问系统。这里用 EnumWindows 把所有可见的顶层窗口标题列一遍，
-# 再用关键字去比 —— 不比对进程、不比对类名，因为那两样用户既看不见也说不清，
-# 而窗口标题正是他在下拉框里点得中的东西。
+# 「在不在」这件事只能问系统。这里用 EnumWindows 把所有可见的顶层窗口走一遍，
+# 拿 **GetClassNameW** 取窗口类名，按类名判断那扇窗还在不在。
 #
-# 标题会变（游戏标题里常带角色名、等级、在线人数），所以存的是**关键字**：
-# 点一下下拉框选到「某某游戏」，存进去的就是整条标题；觉得太长了可以自己删短，
-# 只要那一段还在标题里就认得出来。
+# 为什么不按标题（旧做法）：标题会变 —— 游戏标题里常带角色名、等级、在线人数，
+# 换个角色、进个副本标题就跟存下来的对不上了，盯守就会误报「窗口不见了」。
+# 类名是程序向 Windows 注册的固定字符串（UnrealWindow、Chrome_WidgetWin_1、
+# Notepad 之类），重启、换角色、改分辨率都还是那一个。
+#
+# 类名不像标题那样一眼认得出是哪扇窗，所以**下拉框仍然按标题列**，
+# 每一条后面缀上类名（「剑网3 ｜ UnrealWindow」）；挑一条，写进框里的是类名。
 
 # 本程序自己的窗口不该出现在候选里 —— 它一直在，选错了等于永远「窗口都在」
 OWN_WINDOW_HINTS = ("古风倒计时", "設 置", "传 书 记 录", "盯 守", "导出共用设置")
@@ -3317,6 +3240,11 @@ OWN_WINDOW_HINTS = ("古风倒计时", "設 置", "传 书 记 录", "盯 守", 
 JUNK_WINDOW_TITLES = ("Program Manager", "Default IME", "MSCTFIME UI",
                       "Windows 输入体验", "Windows Input Experience",
                       "Hidden Window", "Task Host Window")
+# 同理，系统外壳与输入法的窗口类名也不该占着下拉框（它们永远在，选了等于永远「都在」）
+JUNK_WINDOW_CLASSES = ("IME", "MSCTFIME UI", "Tooltips_class32", "Shell_TrayWnd",
+                       "Progman", "WorkerW", "SysShadow", "ForegroundStaging",
+                       "TaskListThumbnailWnd", "NotifyIconOverflowWindow",
+                       "InputSiteWindowClass", "EdgeUiInputTopWndClass")
 
 
 def _squeeze(text):
@@ -3336,10 +3264,12 @@ def _is_own_window(title):
     return False
 
 
-def list_windows():
+def list_window_entries():
     """
-    当前所有可见的顶层窗口标题（去重、去掉本程序与系统外壳的）。
+    当前可见的顶层窗口：[(标题, 类名)]，去重、去掉本程序与系统外壳的。
 
+    类名是盯守唯一的判据；标题只用来在下拉框里让人认得出是哪扇窗，
+    所以**没有标题的窗口也照样收**（标题记空串）—— 只按标题筛会漏掉它们。
     取不到就返回空列表 —— 界面会显示「没找到窗口」，而不是崩掉。
     """
     if os.name != "nt":
@@ -3352,6 +3282,7 @@ def list_windows():
         # 截断之后的句柄传给 GetWindowTextW 就是另一个窗口（或直接失败）。
         user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
         user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
         user32.IsWindowVisible.argtypes = [wintypes.HWND]
         user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
                                                     ctypes.POINTER(wintypes.DWORD)]
@@ -3360,6 +3291,7 @@ def list_windows():
 
     own_pid = os.getpid()
     found = []
+    seen = set()
 
     def collect(hwnd, _lparam):
         try:
@@ -3375,16 +3307,27 @@ def list_windows():
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             if pid.value == own_pid:
                 return True
-            length = user32.GetWindowTextLengthW(hwnd)
-            if length <= 0:
+            cbuf = ctypes.create_unicode_buffer(256)
+            if not user32.GetClassNameW(hwnd, cbuf, 256):
                 return True
-            buf = ctypes.create_unicode_buffer(length + 1)
-            user32.GetWindowTextW(hwnd, buf, length + 1)
-            title = (buf.value or "").strip()
+            cls = (cbuf.value or "").strip()
+            if not cls or cls in JUNK_WINDOW_CLASSES:
+                return True
+            length = user32.GetWindowTextLengthW(hwnd)
+            title = ""
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                title = (buf.value or "").strip()
         except Exception:                               # noqa: BLE001
             return True
-        if title and title not in found and not _is_own_window(title):
-            found.append(title)
+        # 标题空着是允许的；有标题时才去说「这是不是本程序/系统外壳的名字」。
+        if title and _is_own_window(title):
+            return True
+        if (title, cls) in seen:
+            return True
+        seen.add((title, cls))
+        found.append((title, cls))
         return True
 
     try:
@@ -3395,14 +3338,33 @@ def list_windows():
     return found[:WINDOW_LIST_MAX]
 
 
-def window_present(keyword, titles=None):
-    """这扇窗在不在。keyword 为空一律算「不在」——否则空关键字会匹配上一切。"""
-    kw = _squeeze(keyword)
-    if not kw:
+def list_window_classes():
+    """当前可见窗口的类名（去重）—— 盯守判断「在不在」用的就是它。"""
+    out = []
+    for _title, cls in list_window_entries():
+        if cls not in out:
+            out.append(cls)
+    return out
+
+
+def list_windows():
+    """可见窗口的标题（老接口，留给「本机上有哪些窗口」这种纯展示场合）。"""
+    return [t for t, _cls in list_window_entries() if t]
+
+
+def window_present(cls, classes=None):
+    """
+    这扇窗（按**类名**）在不在。cls 为空一律算「不在」—— 否则会匹配上一切。
+
+    比对是**整串相同**（忽略空白与大小写），不做包含匹配：类名本来就短，
+    「Unreal」这种半截写法要是能匹配上「UnrealWindow」，等于谁都能冒充。
+    """
+    key = _squeeze(cls)
+    if not key:
         return False
-    pool = list_windows() if titles is None else titles
-    for title in pool:
-        if kw in _squeeze(title):
+    pool = list_window_classes() if classes is None else classes
+    for item in pool:
+        if key == _squeeze(item):
             return True
     return False
 
@@ -3466,6 +3428,10 @@ def save_alert_state(st):
     return reg_store_write(ALERT_STATE_KEY, st)
 
 
+# --------------------------------------------------------------------------
+# 主窗口
+# --------------------------------------------------------------------------
+
 class CountdownApp:
 
     def __init__(self):
@@ -3493,30 +3459,28 @@ class CountdownApp:
 
         # 定时关机与窗口盯守：一样只持有内存引用，注册表那三个值读起来是毫秒级，
         # 对启动速度没有可感影响。
-        self.site_date = reg_store_read(SITE_STATE_KEY, {})
-        if not isinstance(self.site_date, dict):
-            self.site_date = {}
         self.shutdown_state = load_shutdown_state()
         self.watch_state = load_watch_state()
         self.alert_state = load_alert_state()
         self._settle_shutdown_after_restart()
-        self._site_fetching = False     # 取日期正在进行中，防重复点
         self._alert_win = None          # 「窗口不见了」那扇确认窗（真出事时）
         self._drill_win = None          # 「试一遍」演练用的那扇窗（另占一个槽）
         self._disarm_watch_after_reboot()   # 机器重启过 → 盯守推回「等出现」
         self._watch_note = ""
-        # 下一次允许自动取日期的时刻。启动后先静置二十秒：一是把开机那几秒
-        # 留给窗口本身（别让它跟启动抢网络），二是刚开机时网络栈往往还没起来，
-        # 那会儿去取必然失败，白记一笔「取不到」。
-        self._site_next_at = time.time() + SITE_FETCH_START_DELAY
-        # 远程设置：同样先静置二十秒再拉第一次（理由和取关机时刻一样）。
+        # 远程设置：启动后先静置二十秒再拉第一次，把开机那几秒留给窗口本身
+        # （刚开机时网络栈往往还没起来，那会儿去拉必然失败，白记一笔失败）。
         # 静置的是「自动拉」；用户在面板上点「现在就拉」不受这个限制。
         self._remote_fetching = False
-        self._remote_next_at = time.time() + SITE_FETCH_START_DELAY
-        # 远程关机时刻 —— 只由「网址取回的数字」或「设置文件里写死的 at」
-        # 决定，**自己单独一份**。
+        self._remote_next_at = time.time() + REMOTE_FETCH_START_DELAY
+        # 老版本「网址取回的关机时刻」先搬成 at（只搬一次，见那个方法）——
+        # 必须赶在下面 _restore_shutdown_at 之前，否则升级完这台机器就不关了。
+        self._migrate_site_date_to_at()
+        # 顺手把拆掉的那三个键从文件里摘掉（url / auto_fetch / refresh_hours）
+        self._drop_legacy_shutdown_keys()
+        # 关机时刻 —— 只由配置文件里的 shutdown.at 决定（远程设置带回来的
+        # 就是它），**自己单独一份**。
         # 单独存的原因：它和 self.target 是两件事，用户设的倒计时不该被
-        # 「去网站取了一次数」悄悄换掉（v1.6 就是这么错的，别退回那个做法）。
+        # 一份配置文件悄悄换掉（v1.6 就是这么错的，别退回那个做法）。
         # 从数据仓里恢复，所以重启程序之后还认得已经排上的关机时刻。
         # 到点关机时它和 self.target 一起参选，谁先到谁关。
         self.shutdown_at = self._restore_shutdown_at()
@@ -4327,7 +4291,6 @@ class CountdownApp:
         # 带断不行 —— 链一断，倒计时就不走了，关机也不会再发生，
         # 而「到点关机」正是这套功能存在的全部理由。
         for label, probe in (("定时关机", self.shutdown_tick),
-                             ("取关机时间", self.site_fetch_tick),
                              ("窗口盯守", self.watch_tick),
                              ("远程设置", self.remote_fetch_tick)):
             try:
@@ -4695,8 +4658,8 @@ class CountdownApp:
         起一个守护线程，阻塞等「现身」事件（v1.10.3 起替代每秒读信箱文件）。
 
         线程醒来后**不直接碰界面** —— Tk 非线程安全，一律用 root.after
-        把活派回主线程（和联网那几路一个规矩，见 _site_fetch/_remote_fetch
-        的 work()）。阻塞等待不占 CPU、不碰磁盘，正合这程序
+        把活派回主线程（和远程设置拉取那一路一个规矩，见 fetch_remote_now
+        里 work() 的写法）。阻塞等待不占 CPU、不碰磁盘，正合这程序
         「空闲 CPU≈0」的立身之本。
         """
         import threading
@@ -5193,116 +5156,22 @@ class CountdownApp:
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
         set_geometry(win, w, h, (sw - w) // 2, max(20, (sh - h) // 3))
 
-    # ---------------- 定时关机（时刻取自网址或设置文件）----------------
+    # ---------------- 定时关机（时刻来自远程设置那份文件）----------------
     #
     # 流程一句话讲清：
-    #   网址 → （后台线程）取回一串日期数字 → 解析成时刻 → 成为**关机时刻**
-    #   → 到点 → 弹确认窗 → 发关机命令（留一段缓冲可取消）
+    #   远程设置那份文件里的 shutdown.at →（拉回、落盘、reload）
+    #   → 成为**关机时刻** → 到点 → 弹确认窗 → 发关机命令。
     #
-    # 关机时刻还有第二个来处：**设置文件里写死的 shutdown.at**（远程设置 /
-    # 共用设置那份文件带上它即可）。用户只维护一份配置文件 —— 反正远程设置
-    # 也会定时下载，关机时刻写在里面，各台机器取回来就排上，不必再单独
-    # 维护一个返回日期数字的网址。两条路喂的是同一个 self.shutdown_at，
-    # 重启后以文件里的值为准（见 _restore_shutdown_at）。
-    #
-    # 为什么时刻可以由网址/文件说了算，而不是让用户在本机填：那头随时会改，
-    # 改完这边不用动；填死一个时刻的话，每次改都得跑到这台机器上来改。
+    # 为什么不在本机填、也不再单独维护一个「返回日期数字的网址」：
+    # 那头随时会改，改完这边不用动；填死一个时刻的话，每次改都得跑到
+    # 这台机器上来改。用户只维护一份配置文件，关机时刻写在里面就够 ——
+    # v1.11 起那条「从网址取回」的路已经拆掉，留两套只会各说各话。
     #
     # ⚠️ 关机时刻与 self.target（用户倒计时目标）是两个变量，绝不合并 ——
-    # 取一次数就把用户设的日子换掉，是 v1.6 犯过的错。
+    # 一份配置文件把用户设的日子换掉，是 v1.6 犯过的错。
 
     def shutdown_cfg(self):
         return self.cfg.get("shutdown") or {}
-
-    def site_fetch_tick(self, now):
-        """该不该去取一次日期。绝大多数秒只是一次时间戳比较。"""
-        cfg = self.shutdown_cfg()
-        if not (cfg.get("url") or "").strip() or not cfg.get("auto_fetch"):
-            return
-        if self._site_fetching:
-            return
-        if now.timestamp() < self._site_next_at:
-            return
-        # 取一次。取完 _site_fetched 会把下次的时间重新排上：
-        # refresh_hours 是几就隔几小时，是 0 就这一轮不再取（= 只在启动时取一次）。
-        self.fetch_site_now(manual=False)
-
-    def fetch_site_now(self, manual=False, url=None, done=None):
-        """
-        去用户自己的网站取那一串日期数字。返回 None 表示已经派出去，
-        返回字符串表示当场就没法取（没填网址、上一次还没回来）。
-
-        联网一律走后台线程：这一趟最长可能等 12 秒，放在主线程里就是
-        「倒计时卡住 12 秒不动」。取回之后经 root.after 回到主线程落地 ——
-        Tk 的对象只能在主线程碰。
-        """
-        import threading
-        url = (url if url is not None
-               else (self.shutdown_cfg().get("url") or "")).strip()
-        if not url:
-            return "还没填网址"
-        if self._site_fetching:
-            return "上一次还在取，稍等一下"
-        self._site_fetching = True
-
-        def work():
-            try:
-                dt, raw, err = fetch_site_target(url)
-            except Exception as exc:                  # noqa: BLE001
-                dt, raw, err = None, "", "取的时候出了岔子：%s" % exc
-            try:
-                self.root.after(0, lambda: self._site_fetched(
-                    url, dt, raw, err, manual, done))
-            except tk.TclError:
-                pass                                  # 程序正在退出，不用落地了
-
-        threading.Thread(target=work, daemon=True).start()
-        return None
-
-    def _site_fetched(self, url, dt, raw, err, manual, done):
-        """取回来了（在主线程里跑）。"""
-        self._site_fetching = False
-        try:
-            hours = float(self.shutdown_cfg().get("refresh_hours") or 0)
-        except (TypeError, ValueError):
-            hours = 0.0
-        self._site_next_at = time.time() + (hours * 3600 if hours > 0
-                                            else float("inf"))
-        note = err or ""
-        applied = False
-
-        # 取回来的时刻比现在早 —— 网站那头的数字是旧的（或者干脆写错了）。
-        # 这种时刻绝不采用：真当成关机时刻，程序下一秒就会判定「到点了」
-        # 而把机器关掉。宁可什么都不改，把原话讲给用户。
-        if dt is not None and dt <= datetime.datetime.now():
-            err = "取到的时刻已经过去了（%s），没有采用" % pretty_target(dt)
-            dt = None
-            note = err
-
-        if dt is not None:
-            applied, why = self.apply_shutdown_at(dt)
-            if applied:
-                note = "取到「%s」→ 关机时刻定在 %s（倒计时目标没动）" % (
-                    (raw or "").strip()[:40], pretty_target(dt))
-            else:
-                err = why
-                note = why
-
-        # 注意这里那个 "target" 键存的是**关机时刻**，不是倒计时目标
-        # （名字沿用下来了，改它会让老注册表里的记录读不到；读取处见
-        # _restore_shutdown_at）。
-        self.site_date = {"at": _stamp(), "at_ts": time.time(), "url": url,
-                          "raw": (raw or "")[:SITE_RAW_KEEP], "ok": bool(applied),
-                          "target": canonical_target(dt) if applied else "",
-                          "note": note, "auto": not manual}
-        reg_store_write(SITE_STATE_KEY, self.site_date)
-        if manual:
-            self.set_notify_note("取关机时间：" + (note or "好了"))
-        if done:
-            try:
-                done(dt, err)
-            except Exception:                          # noqa: BLE001
-                pass
 
     # ---- 远程设置 ----
 
@@ -5469,59 +5338,85 @@ class CountdownApp:
             return "%s 成功" % when
         return "%s 失败：%s" % (when, (cfg.get("last_note") or "")[:60])
 
+    def _drop_legacy_shutdown_keys(self):
+        """
+        把 v1.11 拆掉的那三个关机配置键从数据文件里摘掉（一次性）。
+
+        `url` / `auto_fetch` / `refresh_hours` 现在没有一句代码读它们了。
+        留着不报错，但用户拿记事本打开设置文件看见 `"url": "http://..."`，
+        只会以为「还能填网址，只是面板没显示」—— 于是去找入口，找不到。
+        所以升级第一次启动就清掉。
+
+        为什么不能只靠面板保存时 pop：`apply_settings` 走的是 `deep_merge`，
+        它只覆盖出现的键、**不会删键** —— 面板上不显示，文件里照样留着。
+        返回是否真删了（自检要看）。
+        """
+        sd = self.cfg.get("shutdown")
+        if not isinstance(sd, dict):
+            return False
+        stale = [k for k in ("url", "auto_fetch", "refresh_hours") if k in sd]
+        if not stale:
+            return False
+        for k in stale:
+            sd.pop(k, None)
+        save_config(self.cfg)
+        return True
+
+    def _migrate_site_date_to_at(self):
+        """
+        老版本（≤ v1.10.x）留下的「网址取回来的时刻」→ 固化成 shutdown.at。
+
+        v1.11 拆掉了「从网址取关机时刻」那条路，可那些机器上最后一次取到的
+        结果还躺在 site_date 里。不搬的话升级完这台机器就再也不关了 ——
+        用户什么都没动，「到点关机」却悄悄失效，这是最不能接受的那种回归。
+
+        三条边界：
+          · 只搬**未来**的时刻（搬一个过去的时刻，下一帧就会报「已过去」）；
+          · 只在 at 还空着的时候搬（远程设置已经给了新时刻就以它为准）；
+          · 搬完把老记录删掉 —— 别再让人看见它，以为还有第二套来源。
+
+        返回是否搬了（自检要看）。
+        """
+        info = reg_store_read(LEGACY_SITE_STATE_KEY, {})
+        if not isinstance(info, dict) or not info:
+            return False
+        sd = self.cfg.get("shutdown")
+        sd = sd if isinstance(sd, dict) else {}
+        if (sd.get("at") or "").strip():
+            reg_store_delete(LEGACY_SITE_STATE_KEY)
+            return False
+        dt = None
+        if info.get("ok"):
+            dt, _err = parse_target((info.get("target") or "").strip())
+        if dt is None or dt <= datetime.datetime.now():
+            reg_store_delete(LEGACY_SITE_STATE_KEY)
+            return False
+        sd = dict(sd)
+        sd["at"] = target_text_of(dt)
+        self.cfg["shutdown"] = sd
+        save_config(self.cfg)
+        reg_store_delete(LEGACY_SITE_STATE_KEY)
+        return True
+
     def _restore_shutdown_at(self):
         """
-        把关机时刻读回来（重启程序后接着用）。两个来处，**设置文件里写的优先**：
+        把关机时刻读回来（重启程序后接着用）。唯一的来处：
 
-          ① cfg["shutdown"]["at"] —— 远程设置 / 共用设置那份文件里直接指定的时刻。
-             用户只维护一份配置文件（远程设置本来就会定时下载），关机时刻写在
-             里面即可，不必再单独维护一个返回日期数字的网址。
-          ② site_date 里那份「已采用」的记录 —— 网址取回那条路的落点。
+          cfg["shutdown"]["at"] —— 远程设置 / 共用设置那份文件里直接指定的时刻。
+          用户只维护一份配置文件（远程设置本来就会定时下载），关机时刻写在
+          里面即可；v1.11 起「从网址取回」那条路已经拆掉，不存第二个来处。
 
-        为什么文件优先：文件是用户此刻明确写下的值；site_date 只是「上次网址
-        取到了什么」的历史记录。两份都在时（既用网址又用设置文件），重启以文件
-        为准；运行期内网址取到新值会当场覆盖（apply_shutdown_at），下次重启
-        又回到文件那一份 —— 两条路喂的是同一个 self.shutdown_at。
+        读不通（手写坏了）就当没写，不报错 —— 宁可这次不关，
+        也绝不凭空猜一个。
 
-        文件里那个时刻读不通（手写坏了）时当没写，继续看 site_date，不报错。
-        两份都读不出、或记录本身标着没采用，就当没有关机时刻 ——
-        宁可这次不关，也绝不凭空猜一个。
+        ⚠️ 只读配置，绝不碰 self.cfg["target"] 与 self.target：
+        那个是用户自己设的倒计时目标，和「这台机器几点关」是两件事。
         """
         text = ((self.cfg.get("shutdown") or {}).get("at") or "").strip()
-        if text:
-            dt, _err = parse_target(text)
-            if dt is not None:
-                return dt
-        info = self.site_date if isinstance(self.site_date, dict) else {}
-        if not info.get("ok"):
-            return None
-        text = (info.get("target") or "").strip()
         if not text:
             return None
         dt, _err = parse_target(text)
         return dt
-
-    def apply_shutdown_at(self, dt):
-        """
-        把取到的时刻落成**关机时刻**。返回 (是否已采用, 说明)。
-
-        网址取回那条路走这里（_site_fetched 调它）。设置文件那条路
-        （cfg["shutdown"]["at"]）不走这里 —— 它经 reload_from_store →
-        _restore_shutdown_at 直接落 self.shutdown_at（reload 时 _armed_keys
-        整个重置，效果一样）。
-
-        这里刻意**不碰** self.cfg["target"] 与 self.target。
-        那个是用户自己设的倒计时目标，和「这台机器几点关」是两件事；
-        跑去网站取一次数就把人家设的日子换掉，是 v1.6 犯过的错。
-        """
-        self.shutdown_at = dt
-        # 换了一个远程时刻 = 换了一件事：把「已经亲眼见过它还没到」的记号作废。
-        # 不作废的话，新时刻会被旧记号带着直接通过准入检查 ——
-        # 而它很可能根本就是个已经过去的时刻。
-        self._armed_keys = set(k for k in self._armed_keys
-                               if not k.startswith("remote|"))
-        self._refresh_menu()
-        return True, ""
 
     # ---- 两个来源，谁先到谁关 ----
 
@@ -5913,7 +5808,7 @@ class CountdownApp:
 
     def watch_tick(self, now):
         cfg = self.watch_cfg()
-        keyword = (cfg.get("title") or "").strip()
+        keyword = (cfg.get("title") or "").strip()      # 是窗口类名（键名沿袭旧版）
         st = self.watch_state
 
         if not cfg.get("enabled") or not keyword:
@@ -6209,7 +6104,7 @@ class CountdownApp:
         st = self.watch_state
         if not cfg.get("enabled"):
             return "未开启"
-        keyword = (cfg.get("title") or "").strip()
+        keyword = (cfg.get("title") or "").strip()      # 窗口类名
         if not keyword:
             return "还没选要盯的窗口"
         phase = st.get("phase")
@@ -6385,7 +6280,7 @@ class CountdownApp:
 
         清理范围（都在同一个数据键里，一个键装了全部）：
           目标时刻 / 颜色规则 / 配色 / 邮箱与授权码 / 寄信履历 / 窗口位置与大小 /
-          定时关机的网址 / 窗口盯守的设置与状态。
+          定时关机的设置与状态 / 窗口盯守的设置与状态。
         不动开机自启 —— 它写在另一个地方（HKCU\\...\\Run，见 set_autostart），
         属于「系统里装了什么」，不是「这个程序里存了什么」；
         而且用户多半正是靠自启才看得见这个按钮，顺手清掉反而添乱。
@@ -6416,11 +6311,10 @@ class CountdownApp:
         # 盯守与关机的状态也在那个数据键里，已经被删了 ——
         # 内存里那份必须跟着归零，否则界面还显示着「盯着某某游戏」，
         # 而注册表里已经什么都没有，用户再点一次保存才可能对上。
-        self.site_date = {}
         self.shutdown_state = load_shutdown_state()
         self.watch_state = load_watch_state()
         self.alert_state = load_alert_state()
-        self.shutdown_at = None          # 网址也清掉了，自然没有关机时刻
+        self.shutdown_at = None          # 配置也清掉了，自然没有关机时刻
         self._armed_keys = set()
         self._close_shutdown_window()
         self._close_alert_window()
@@ -6469,16 +6363,13 @@ class CountdownApp:
         self.cfg = load_config()
         self.secret = load_notify_secret()
         self.notify_state = load_notify_state()
-        # 盯守与关机的状态也一并重读：共用设置文件可能把「盯哪扇窗」「关机网址」
+        # 盯守与关机的状态也一并重读：共用设置文件可能把「盯哪扇窗」「关机时刻」
         # 整个换掉，只换配置不换状态的话，两边的窗口名就对不上了
         # （对不上的后果由 watch_tick 兜住：它会当场把状态机推倒重来）。
         self.shutdown_state = load_shutdown_state()
         self.watch_state = load_watch_state()
         self.alert_state = load_alert_state()
-        self.site_date = reg_store_read(SITE_STATE_KEY, {})
-        if not isinstance(self.site_date, dict):
-            self.site_date = {}
-        # 关机时刻跟着重读：共用设置文件可能把网址整个换掉，
+        # 关机时刻跟着重读：远程设置 / 共用设置可能把 shutdown.at 换了，
         # 那种情况下旧的关机时刻就不再作数了。
         self.shutdown_at = self._restore_shutdown_at()
 
@@ -6537,7 +6428,7 @@ class ExportPicker:
     W = 440
 
     def __init__(self, app, on_pick, specs=None, current=None, title=None,
-                 note=None, persist=None):
+                 note=None, persist=None, mask_opt=False):
         self.app = app
         self.on_pick = on_pick
         self.specs = list(specs) if specs is not None else list(SHARED_ITEMS)
@@ -6547,6 +6438,11 @@ class ExportPicker:
                              "　的设置会原样留着 —— 不会被这台的样子覆盖掉。")
         # 勾选结果存到哪儿：导出是「记住上次那套」，远程是「写回本机配置」。
         self.persist = persist if persist is not None else save_shared_selection
+        # 脱敏那一行只有导出共用设置才有（远程拉取不碰凭据，给它看是误导）。
+        # 默认不勾：完整导出是主路径（U 盘拷给自己人的机器，凭据就该跟着走）；
+        # 要发到公开场合的人才需要主动勾上。
+        self.mask_opt = bool(mask_opt)
+        self.mask_on = False
         pal = app.cfg["palette"]
         self.pal = pal
         self.rows = []              # [(key, 那个方框 Label)]
@@ -6622,6 +6518,8 @@ class ExportPicker:
         pal, app = self.pal, self.app
         tk.Frame(self.body, bg=pal["border_soft"], height=1).pack(
             fill="x", padx=16, pady=(12, 0))
+        if self.mask_opt:
+            self._build_mask_row()
         bar = tk.Frame(self.body, bg=pal["paper"])
         bar.pack(fill="x", padx=16, pady=10)
 
@@ -6642,6 +6540,35 @@ class ExportPicker:
                           font=(app.fam_cn, 10), cursor="hand2", padx=10, pady=4)
         cancel.pack(side="right", padx=(0, 8))
         cancel.bind("<Button-1>", lambda e: self.close())
+
+    def _build_mask_row(self):
+        """
+        「敏感信息脱敏」那一行（只有导出共用设置才有）。
+
+        默认不勾是刻意的：完整导出是主路径 —— U 盘拷给自己人的机器，
+        凭据就该跟着走，不然对方还要重填一遍密码。脱敏是给「这份文件
+        要发布到公开场合」准备的：网盘链接、群里、公开仓库。
+        """
+        pal, app = self.pal, self.app
+        row = tk.Frame(self.body, bg=pal["paper"])
+        row.pack(fill="x", padx=16, pady=(2, 0))
+        self.mask_box = tk.Label(row, text="☐", bg=pal["paper"],
+                                 font=(app.fam_cn, 12), cursor="hand2", width=2)
+        self.mask_box.pack(side="left", anchor="n")
+        txt = tk.Label(
+            row, bg=pal["paper"], fg=pal["ink"], font=(app.fam_cn, 9),
+            anchor="w", justify="left",
+            text="敏感信息脱敏（授权码、远程密码与令牌打码后导出，\n"
+                 "可放心分享或发布；对方机器上保留各自原来的）")
+        txt.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        for w in (row, self.mask_box, txt):
+            w.bind("<Button-1>", lambda e: self._toggle_mask())
+
+    def _toggle_mask(self):
+        self.mask_on = not self.mask_on
+        self.mask_box.configure(
+            text="☑" if self.mask_on else "☐",
+            fg=self.pal["seal"] if self.mask_on else self.pal["border"])
 
     # ---- 行为 ----
 
@@ -7212,19 +7139,20 @@ class SettingsPanel:
 
     def _build_shutdown(self, parent):
         """
-        定时关机：网址取日期（或设置文件里写死时刻）→ 那就是**关机时刻**
+        定时关机：远程设置那份文件里的 shutdown.at → 那就是**关机时刻**
         → 到点关机。
 
         三点是刻意这么写的：
 
-        · 取回的时刻**只用来关机**，不动上面那个「目标时刻」。那是用户自己设的
+        · 那个时刻**只用来关机**，不动上面那个「目标时刻」。那是用户自己设的
           倒计时，跟「这台机器几点关」是两件事。早先的版本把两者合成一个，
           取一次日期就把用户的倒计时换掉了 —— 已经被指出来过一次，别再合并。
-        · 不给「关机时刻」单独放输入框：那个时刻的权威来源是网址或设置文件，
-          再给一个框两处都能改，用户永远搞不清以哪个为准。想知道现在定的是几点，
-          看下面那行「当前关机时刻」。
-        · 设置文件里写着关机时刻时，下面会多一行灰字说明它的来处 ——
-          用户没填网址却看见关机时刻，不至于以为程序出了错。
+        · 不给「关机时刻」单独放输入框，也**不再给网址**（v1.11 拆掉了
+          「从网址取」那条路）：唯一来源是远程设置 / 共用设置那份文件，
+          再给一个入口，两处都能改，用户永远搞不清以哪个为准。
+          想知道现在定的是几点，看下面那行「当前关机时刻」。
+        · 那行下面紧跟两行灰字：时刻从哪儿来、上次拉远程设置是什么时候成没成。
+          用户什么都没填却看见关机时刻，不至于以为程序出了错。
         """
         app, pal = self.app, self.pal
         sd = app.shutdown_cfg()
@@ -7245,76 +7173,35 @@ class SettingsPanel:
                                   activeforeground=pal["seal"],
                                   font=(app.fam_cn, 10), anchor="w",
                                   justify="left", bd=0,
-                                  highlightthickness=0), 56).pack(fill="x")
+                                  highlightthickness=0), 48).pack(fill="x")
 
         # 第二个来源。默认勾上：用户明确要「倒计时到了也关」。
-        # 不勾就是只听网址的 —— 那种机器上倒计时只是个提醒日。
+        # 不勾就是只听远程设置的 —— 那种机器上倒计时只是个提醒日。
         self.var_from_target = tk.BooleanVar(value=bool(sd.get("from_target", True)))
-        self._wrap(tk.Checkbutton(wrap, text="  倒计时目标到了也关（不勾＝只听网址的）",
+        self._wrap(tk.Checkbutton(wrap, text="  倒计时目标到了也关（不勾＝只听远程的）",
                                   variable=self.var_from_target, bg=pal["paper"],
                                   fg=pal["ink"], selectcolor="#FFFBF2",
                                   activebackground=pal["paper"],
                                   activeforeground=pal["seal"],
                                   font=(app.fam_cn, 10), anchor="w",
                                   justify="left", bd=0,
-                                  highlightthickness=0), 56).pack(fill="x")
+                                  highlightthickness=0), 48).pack(fill="x")
 
-        row = tk.Frame(wrap, bg=pal["paper"])
-        row.pack(fill="x", pady=(6, 0))
-        tk.Label(row, text="网址", bg=pal["paper"], fg=pal["ink_soft"],
-                 font=(app.fam_cn, 10), width=7, anchor="w").pack(side="left")
-        self.entry_url = tk.Entry(row, font=(app.fam_num, 10), bg="#FFFBF2",
-                                  fg=pal["ink"], relief="flat",
-                                  insertbackground=pal["seal"],
-                                  highlightthickness=1,
-                                  highlightbackground=pal["border_soft"],
-                                  highlightcolor=pal["seal"])
-        self.entry_url.insert(0, sd.get("url") or "")
-        self.entry_url.pack(side="left", fill="x", expand=True, ipady=3)
-        fetch_btn = tk.Label(row, text="获取", bg=pal["paper"], fg=pal["ink_soft"],
-                             font=(app.fam_cn, 10), cursor="hand2",
-                             padx=8, pady=2, relief="solid", bd=1)
-        fetch_btn.pack(side="left", padx=(8, 0))
-        fetch_btn.bind("<Button-1>", lambda e: self._fetch_site_now())
-        fetch_btn.bind("<Enter>", lambda e: fetch_btn.configure(fg=pal["seal"]))
-        fetch_btn.bind("<Leave>", lambda e: fetch_btn.configure(fg=pal["ink_soft"]))
+        # 这一节没有输入框了 —— 时刻从哪儿来必须当面说清，否则「关机时刻」
+        # 是从天上掉下来的。文案由 _sync_shutdown_note 按 at 有没有写来换。
+        self.shut_src_lbl = self._wrap(tk.Label(wrap, text="", bg=pal["paper"],
+                                                fg=pal["ink_soft"],
+                                                font=(app.fam_cn, 9),
+                                                anchor="w", justify="left"), 40)
+        self.shut_src_lbl.pack(fill="x", pady=(6, 0))
 
-        self.site_msg = self._wrap(tk.Label(wrap, text="", bg=pal["paper"],
-                                            fg=pal["ink_soft"], font=(app.fam_cn, 9),
-                                            anchor="w", justify="left"), 40)
-        self.site_msg.pack(fill="x", pady=(4, 0))
-        self._show_site_result()
-
-        opt = tk.Frame(wrap, bg=pal["paper"])
-        opt.pack(fill="x", pady=(6, 0))
-        self.var_auto_site = tk.BooleanVar(value=bool(sd.get("auto_fetch", True)))
-        tk.Checkbutton(opt, text="  启动时自动取一次", variable=self.var_auto_site,
-                       bg=pal["paper"], fg=pal["ink"], selectcolor="#FFFBF2",
-                       activebackground=pal["paper"], activeforeground=pal["seal"],
-                       font=(app.fam_cn, 10), anchor="w", bd=0,
-                       highlightthickness=0).pack(side="left")
-
-        # 「每隔 N 小时再取一次」单独占一行。原来它跟上面那句挤在同一行，
-        # 面板一缩窄，右边「小时再取一次」几个字就被裁掉了 —— 单行控件
-        # 不会自己换行，界面也不报错，就是字没了。
-        opt2 = tk.Frame(wrap, bg=pal["paper"])
-        opt2.pack(fill="x", pady=(2, 0))
-        self.var_site_hours = tk.BooleanVar(
-            value=float(sd.get("refresh_hours") or 0) > 0)
-        tk.Checkbutton(opt2, text="  每隔", variable=self.var_site_hours,
-                       bg=pal["paper"], fg=pal["ink"], selectcolor="#FFFBF2",
-                       activebackground=pal["paper"], activeforeground=pal["seal"],
-                       font=(app.fam_cn, 10), bd=0,
-                       highlightthickness=0).pack(side="left")
-        self.var_hours = tk.StringVar(
-            value="%g" % float(sd.get("refresh_hours") or 6))
-        tk.Entry(opt2, textvariable=self.var_hours, width=4, justify="center",
-                 font=(app.fam_num, 10), bg="#FFFBF2", fg=pal["ink"],
-                 relief="flat", insertbackground=pal["seal"],
-                 highlightthickness=1, highlightbackground=pal["border_soft"],
-                 highlightcolor=pal["seal"]).pack(side="left", padx=(2, 2), ipady=2)
-        tk.Label(opt2, text="小时再取一次", bg=pal["paper"], fg=pal["ink"],
-                 font=(app.fam_cn, 10)).pack(side="left")
+        # 上次拉远程设置是什么时候、成没成 —— 用户怀疑「怎么没排上」时，
+        # 这一行就是唯一能自己核对的东西（要重拉去下面「远程设置」那一节）。
+        self.remote_sync_lbl = self._wrap(tk.Label(wrap, text="", bg=pal["paper"],
+                                                  fg=pal["border"],
+                                                  font=(app.fam_cn, 9),
+                                                  anchor="w", justify="left"), 40)
+        self.remote_sync_lbl.pack(fill="x", pady=(1, 0))
 
         row2 = tk.Frame(wrap, bg=pal["paper"])
         row2.pack(fill="x", pady=(6, 0))
@@ -7330,24 +7217,13 @@ class SettingsPanel:
         tk.Label(row2, text="秒（没人理就关）", bg=pal["paper"], fg=pal["ink_soft"],
                  font=(app.fam_cn, 10)).pack(side="left")
 
-        # 现在定的是几点关 —— 单独一行、加粗，取完日期当场能看见。
-        # 没有这一行的话，用户点完「获取」只能从一行小字里猜到底取到了什么。
+        # 现在定的是几点关 —— 单独一行、加粗。没有这一行，用户只能从
+        # 一行小字里猜到底排上了什么。
         self.shut_at_lbl = self._wrap(tk.Label(wrap, text="", bg=pal["paper"],
                                                fg=pal["seal"],
                                                font=(app.fam_cn, 10, "bold"),
                                                anchor="w", justify="left"), 40)
         self.shut_at_lbl.pack(fill="x", pady=(8, 0))
-
-        # 关机时刻写在设置文件里时的那一行说明。只读 —— 那个时刻的权威是
-        # 远程设置 / 共用设置那份文件（和网址同一个道理：再给一个输入框，
-        # 两处都能改，用户永远搞不清以哪个为准）。要改去改那份配置文件。
-        # **刻意不在这里 pack**：没指定 at 时它一行都不占（面板内容高度是
-        # 卡着屏幕七成算的，多一行空Label就可能把滚动条顶出来）。
-        # 露不露面由 _sync_shutdown_note 按 cfg.shutdown.at 决定。
-        self.shut_src_lbl = self._wrap(tk.Label(wrap, text="", bg=pal["paper"],
-                                                fg=pal["ink_soft"],
-                                                font=(app.fam_cn, 9),
-                                                anchor="w", justify="left"), 40)
 
         self.shut_msg = self._wrap(tk.Label(wrap, text="", bg=pal["paper"],
                                             fg=pal["ink_soft"], font=(app.fam_cn, 9),
@@ -7364,7 +7240,7 @@ class SettingsPanel:
         try_btn.bind("<Enter>", lambda e: try_btn.configure(fg=pal["seal"]))
         try_btn.bind("<Leave>", lambda e: try_btn.configure(fg=pal["ink_soft"]))
 
-        self._wrap(tk.Label(wrap, text="　网址那个时刻只用来关机，不会动上面那个倒计时目标；"
+        self._wrap(tk.Label(wrap, text="　远程设置那个时刻只用来关机，不会动上面那个倒计时目标；"
                                         "倒计时那个也一样，只用来关机。两个谁先到就按谁关。",
                             bg=pal["paper"], fg=pal["border"], font=(app.fam_cn, 9),
                             anchor="w", justify="left"), 40).pack(fill="x", pady=(2, 0))
@@ -7383,25 +7259,12 @@ class SettingsPanel:
                 text="　弹出来了 —— 倒计时走完的话，真关机就是这个样子。",
                 fg=self.pal["ink_soft"])
 
-    def _show_site_result(self):
-        """把最近一次取日期的结果写在面板上，免得只能靠猜。"""
-        if not hasattr(self, "site_msg"):
-            return
-        info = self.app.site_date or {}
-        if not info.get("at"):
-            self.site_msg.configure(text="　还没取过。点右边「获取」试一次。",
-                                    fg=self.pal["border"])
-            return
-        text = "　%s　%s" % (info.get("at", "")[:16], info.get("note") or "")
-        self.site_msg.configure(text=text,
-                                fg="#4F7A52" if info.get("ok") else self.pal["seal"])
-
     def _sync_shutdown_note(self):
         """
-        面板上要能一眼看见：现在会按几点关、正在推进到哪一步、有没有错过。
+        面板上要能一眼看见：现在会按几点关、时刻从哪儿来、正在推进到哪一步。
 
         第一行显示的是**两个来源里先到的那个** —— 那才是真正会触发关机
-        的时刻。只显示网址那个的话，用户设了更早的倒计时会看不懂
+        的时刻。只显示远程设置那个的话，用户设了更早的倒计时会看不懂
         「为什么明明还没到点就关了」。
         """
         if not hasattr(self, "shut_msg"):
@@ -7414,21 +7277,28 @@ class SettingsPanel:
             self.shut_at_lbl.configure(
                 text="　当前关机时刻：%s" % self.app.shutdown_left_text(),
                 fg=self.pal["seal"] if dt is not None else self.pal["ink_soft"])
-        # 关机时刻是设置文件里写死的时候，说清它从哪儿来 ——
-        # 否则用户没填网址却看见一个关机时刻，只会以为程序出了错。
-        # 没指定 at 时这行整个不占地方（pack_forget），面板高度不受影响。
+
+        # 时刻从哪儿来。这一节没有输入框了，不说清的话「关机时刻」就像从天上
+        # 掉下来的；没排上时更要说，否则用户不知道该去哪儿写。
         if hasattr(self, "shut_src_lbl"):
             at_text = ((self.app.cfg.get("shutdown") or {}).get("at") or "").strip()
             if at_text:
                 self.shut_src_lbl.configure(
-                    text="　（这个时刻写在设置文件里，要改去改那份配置文件）")
-                if not self.shut_src_lbl.winfo_manager():
-                    # before= 钉住位置：它在「当前关机时刻」与「关机状态」之间。
-                    # 不钉的话 pack 会把它甩到这一节末尾（试一遍按钮后面）去。
-                    self.shut_src_lbl.pack(fill="x", pady=(2, 0),
-                                           before=self.shut_msg)
-            elif self.shut_src_lbl.winfo_manager():
-                self.shut_src_lbl.pack_forget()
+                    text="　时刻来自远程设置里的 shutdown.at；改完在下面点「现在就拉一次」。")
+            else:
+                self.shut_src_lbl.configure(
+                    text="　还没有关机时刻：在远程设置那份文件里写 shutdown.at 就能排上。")
+
+        # 上次拉远程设置是什么时候、成没成 —— 用户怀疑「怎么没排上」时，
+        # 这一行是他唯一能自己核对的东西。
+        if hasattr(self, "remote_sync_lbl"):
+            note = self.app.remote_status_text()
+            ok = bool(self.app.remote_cfg().get("last_ok"))
+            self.remote_sync_lbl.configure(
+                text="　远程设置：%s" % note,
+                fg=self.pal["border"] if (ok or note == "还没拉过")
+                else self.pal["seal"])
+
         st = self.app.shutdown_state or {}
         phase = st.get("phase") or ""
         if phase == "asking":
@@ -7450,37 +7320,6 @@ class SettingsPanel:
         else:
             self.shut_msg.configure(text="", fg=self.pal["ink_soft"])
 
-    def _fetch_site_now(self):
-        """面板上点「获取」：拿输入框里现打的网址去取（不必先保存）。"""
-        url = self.entry_url.get().strip()
-        if not url:
-            self.site_msg.configure(text="　先填网址", fg=self.pal["seal"])
-            return
-        err = self.app.fetch_site_now(manual=True, url=url, done=self._site_done)
-        if err:
-            self.site_msg.configure(text="　" + err, fg=self.pal["seal"])
-        else:
-            self.site_msg.configure(text="　正在取…", fg=self.pal["ink_soft"])
-
-    def _site_done(self, dt, err):
-        """取回来了。回调跑在主线程，但仍然要防面板已经关了。"""
-        try:
-            if not self.win.winfo_exists():
-                return
-        except tk.TclError:
-            return
-        if err or dt is None:
-            self.site_msg.configure(text="　" + (err or "没取到"), fg=self.pal["seal"])
-            self._sync_shutdown_note()
-            return
-        # 刻意**不动**上面那个目标框：取回来的时刻只作关机用。
-        # 早先这里会把取到的时刻填进目标框连配置一起改，用户设的倒计时
-        # 就这么被换掉了 —— 那是错的，别再退回去。
-        self.site_msg.configure(
-            text="　取到了：%s（已设为关机时刻，倒计时目标没动）" % pretty_target(dt),
-            fg="#4F7A52")
-        self._sync_shutdown_note()
-
     def _collect_shutdown(self):
         raw = self.var_grace.get().strip()
         try:
@@ -7490,37 +7329,21 @@ class SettingsPanel:
         if not 0 <= grace <= SHUTDOWN_GRACE_MAX:
             return None, "「关机前弹窗等几秒」要在 0 ~ %d 之间" % SHUTDOWN_GRACE_MAX
 
-        hours = 0.0
-        if self.var_site_hours.get():
-            try:
-                hours = float(self.var_hours.get().strip() or 0)
-            except ValueError:
-                return None, "「每隔几小时再取一次」要填数字，可以带小数"
-            if not 0 < hours <= 168:
-                return None, "「每隔几小时再取一次」要在 0 ~ 168 之间（一周）"
-
-        url = self.entry_url.get().strip()
-        if url and not re.match(r"^https?://", url, re.I):
-            # 用户十有八九只写域名。这里替他补上并回显 ——
-            # 悄悄补而不显示的话，他下次看到自己写的那行会以为程序没记住。
-            url = "http://" + url
-            self.entry_url.delete(0, "end")
-            self.entry_url.insert(0, url)
-
         # 从当前配置起手再改面板上能编辑的那几项 —— 和 _collect_remote 同一套路子。
-        # 关键是 **at 原样带回**：关机时刻的权威是设置文件（或网址），面板上
-        # 没有它的输入框（两处都能改，用户永远搞不清以哪个为准），保存时绝不能
-        # 把它冲掉。deep_merge 本来也保得住，这里显式写出来是为了别被将来
-        # 改合并逻辑的人悄悄弄丢。
+        # 关键是 **at 原样带回**：关机时刻的权威是远程设置 / 共用设置那份文件，
+        # 面板上没有它的输入框（两处都能改，用户永远搞不清以哪个为准），保存时
+        # 绝不能把它冲掉。deep_merge 本来也保得住，这里显式写出来是为了别被
+        # 将来改合并逻辑的人悄悄弄丢。
         cfg = dict(self.app.shutdown_cfg())
         cfg.update({
             "enabled": bool(self.var_shut.get()),
             "from_target": bool(self.var_from_target.get()),
-            "url": url,
-            "auto_fetch": bool(self.var_auto_site.get()),
-            "refresh_hours": hours,
             "grace_sec": grace,
         })
+        # 老版本留下的三个键（url / auto_fetch / refresh_hours）已经没人读了，
+        # 保存时顺手摘掉 —— 留在文件里只会让人以为还有一套「从网址取」。
+        for stale in ("url", "auto_fetch", "refresh_hours"):
+            cfg.pop(stale, None)
         return cfg, None
 
     def _build_thresholds(self, parent):
@@ -7608,6 +7431,25 @@ class SettingsPanel:
                             font=(app.fam_cn, 9), anchor="w", justify="left"), 40).pack(
             fill="x", pady=(1, 0))
 
+        # 拉取间隔。以前它只活在配置文件里（面板上没有输入框，想改只能拿
+        # 记事本打开 设置.json），用户找了一圈问「拉取的间隔没有吗」——
+        # 不是没有，是藏得太深。0 = 只在启动时拉一次，之后不再自己醒
+        # （remote_fetch_tick 认这个语义，见 _remote_fetched 里重排下次的那段）。
+        row_h = tk.Frame(wrap, bg=pal["paper"])
+        row_h.pack(fill="x", pady=(6, 0))
+        tk.Label(row_h, text="拉取间隔", bg=pal["paper"], fg=pal["ink_soft"],
+                 font=(app.fam_cn, 10)).pack(side="left")
+        _rh = app.remote_cfg().get("refresh_hours")
+        self.var_rhours = tk.StringVar(
+            value="%g" % float(6 if _rh is None else _rh))
+        tk.Entry(row_h, textvariable=self.var_rhours, width=4, justify="center",
+                 font=(app.fam_num, 10, "bold"), bg="#FFFBF2", fg=pal["ink"],
+                 relief="flat", insertbackground=pal["seal"],
+                 highlightthickness=1, highlightbackground=pal["border_soft"],
+                 highlightcolor=pal["seal"]).pack(side="left", padx=(4, 4), ipady=3)
+        tk.Label(row_h, text="小时（0 ＝ 只在启动时拉）", bg=pal["paper"],
+                 fg=pal["ink_soft"], font=(app.fam_cn, 10)).pack(side="left")
+
         bar = tk.Frame(wrap, bg=pal["paper"])
         bar.pack(fill="x", pady=(8, 0))
         for text, act in (("现在就拉一次", self._pull_remote_now),
@@ -7656,9 +7498,17 @@ class SettingsPanel:
             return None, None, "勾了「自动从网址取回设置」，请先填写网址"
         if enabled and mode == "basic" and not self.entry_ruser.get().strip():
             return None, None, "认证方式选了「用户名 + 密码」，用户名不能空着"
+        # 拉取间隔：面板上现在有输入框了（v1.11 补的）。0 = 只在启动时拉一次。
+        try:
+            hours = float(self.var_rhours.get().strip() or 6)
+        except ValueError:
+            return None, None, "「拉取间隔」要填数字，可以带小数"
+        if not 0 <= hours <= 168:
+            return None, None, "「拉取间隔」要在 0 ~ 168 之间（一周）"
         cfg = dict(self.app.remote_cfg())
         cfg.update({"enabled": enabled, "url": url, "auth": mode,
-                    "user": self.entry_ruser.get().strip()})
+                    "user": self.entry_ruser.get().strip(),
+                    "refresh_hours": hours})
         creds = {"remote_password": self.entry_rpass.get(),
                  "remote_token": self.entry_rtoken.get().strip(),
                  "remote_header_name": self.entry_rhname.get().strip(),
@@ -8170,7 +8020,7 @@ class SettingsPanel:
 
         row2 = tk.Frame(wrap, bg=pal["paper"])
         row2.pack(fill="x", pady=(6, 0))
-        tk.Label(row2, text="关键字", bg=pal["paper"], fg=pal["ink_soft"],
+        tk.Label(row2, text="类名", bg=pal["paper"], fg=pal["ink_soft"],
                  font=(app.fam_cn, 10), width=7, anchor="w").pack(side="left")
         self.entry_watch = tk.Entry(row2, font=(app.fam_num, 10), bg="#FFFBF2",
                                     fg=pal["ink"], relief="flat",
@@ -8181,8 +8031,8 @@ class SettingsPanel:
         self.entry_watch.insert(0, wc.get("title") or "")
         self.entry_watch.pack(side="left", fill="x", expand=True, ipady=3)
 
-        self._wrap(tk.Label(wrap, text="　标题里常带角色名、等级、在线人数，存整条下次就对不上了。"
-                                       "挑好之后把关键字改短，只留认得出那扇窗的一段。",
+        self._wrap(tk.Label(wrap, text="　盯的是窗口类名（程序注册给系统的固定名字，如 UnrealWindow），"
+                                       "不随角色名、等级、在线人数变。上面挑一条就会自动填进来。",
                             bg=pal["paper"], fg=pal["border"], font=(app.fam_cn, 9),
                             anchor="w", justify="left"), 40).pack(fill="x", pady=(2, 0))
 
@@ -8263,56 +8113,77 @@ class SettingsPanel:
                                 anchor="w", justify="left"), 40).pack(fill="x", pady=(2, 0))
 
         self._reload_window_list(False)
+        self._hint_legacy_watch()
         self._sync_watch_status()
         self._poll_watch()
 
-    def _reload_window_list(self, verbose=False):
-        """把「此刻开着的窗口」填进下拉框。只在这里枚举 —— 那要几毫秒，不必每秒做。"""
+    def _hint_legacy_watch(self):
+        """
+        旧版存的是**窗口标题**，这版当**类名**用 —— 老配置升上来必然对不上。
+
+        怎么认出来（零状态，只看眼前这一屏）：框里那串既不是任何窗口的类名，
+        却能匹配上某扇窗的标题 —— 那就是条标题，请用户重新挑一次。
+        程序没开着的时候两边都匹配不到，不出提示（免得平白吓人）。
+        """
+        keyword = (self.app.watch_cfg().get("title") or "").strip()
+        if not keyword or window_present(keyword):
+            return
+        key = _squeeze(keyword)
         titles = list_windows()
+        if not any(key and key in _squeeze(t) for t in titles):
+            return
+        self.watch_msg.configure(
+            text="　框里像是一条窗口标题 —— 这版改成按「类名」盯了，"
+                 "请从上面下拉框重新挑一次，再点保存。",
+            fg=self.pal["seal"])
+
+    def _reload_window_list(self, verbose=False):
+        """把「此刻开着的窗口」填进下拉框。只在这里枚举 —— 那要几毫秒，不必每秒做。
+
+        每一条显示成「标题 ｜ 类名」：类名才是判据，但光看类名认不出是哪扇窗。
+        **没标题的窗口不进下拉框**（列表里全是「（无标题窗口）」没法挑），
+        但它们照常参与「在不在」的判断 —— 那走的是 list_window_classes 全量。
+        """
+        entries = [e for e in list_window_entries() if e[0]]
         menu = self.win_pick["menu"]
         menu.delete(0, "end")
-        if not titles:
+        if not entries:
             menu.add_command(label="（没找到可见窗口）", command=lambda: None)
-        for title in titles:
-            menu.add_command(label=title,
-                             command=lambda v=title: self._pick_window(v))
+        for title, cls in entries:
+            label = "%s　｜　%s" % (title, cls)
+            menu.add_command(label=label,
+                             command=lambda t=title, c=cls: self._pick_window(t, c))
         self.var_pick.set("（点这里挑一个）")
         if verbose and hasattr(self, "watch_msg"):
-            if titles:
-                self.watch_msg.configure(text="列出了 %d 扇窗，挑一个" % len(titles),
+            if entries:
+                self.watch_msg.configure(text="列出了 %d 扇窗，挑一个" % len(entries),
                                          fg=self.pal["ink_soft"])
             else:
                 self.watch_msg.configure(text="没找到可见窗口（要先把游戏开起来）",
                                          fg=self.pal["seal"])
 
-    def _pick_window(self, title):
-        """从下拉框挑了一扇：填进关键字框，用户还能接着改短。"""
-        self.var_pick.set(title)
+    def _pick_window(self, title, cls):
+        """从下拉框挑了一扇：框里填**类名**（判据），提示里带上标题让人确认没挑错。"""
+        self.var_pick.set("%s　｜　%s" % (title or "（无标题窗口）", cls))
         self.entry_watch.delete(0, "end")
-        self.entry_watch.insert(0, title)
-        self.watch_msg.configure(text="已选：%s" % title[:40], fg=self.pal["ink_soft"])
+        self.entry_watch.insert(0, cls)
+        self.watch_msg.configure(text="已选：%s（%s）" % (cls[:32], (title or "无标题")[:28]),
+                                 fg=self.pal["ink_soft"])
 
     def _probe_watch_now(self):
         """立刻看一眼：不推进状态机，只让用户当场知道认不认得出这扇窗。"""
-        kw = self.entry_watch.get().strip()
-        if not kw:
-            self.watch_msg.configure(text="先挑一扇窗，或者手填一段关键字",
+        cls = self.entry_watch.get().strip()
+        if not cls:
+            self.watch_msg.configure(text="先挑一扇窗，或者手填一个窗口类名",
                                      fg=self.pal["seal"])
             return
-        titles = list_windows()
-        hit = None
-        key = _squeeze(kw)
-        for title in titles:
-            if key and key in _squeeze(title):
-                hit = title
-                break
-        if hit:
+        if window_present(cls):
             self.watch_msg.configure(
-                text="现在能看到它：%s　（真出事是什么样子，点右边「试一遍」演给你看）"
-                     % hit[:32], fg="#4F7A52")
+                text="现在能看到类名为「%s」的窗口　（真出事是什么样子，点右边「试一遍」演给你看）"
+                     % cls[:32], fg="#4F7A52")
         else:
             self.watch_msg.configure(
-                text="现在看不到这个窗口。若它本来就还没开，这是正常的 —— "
+                text="现在看不到这个类名的窗口。若它本来就还没开，这是正常的 —— "
                      "程序要「先看见过一次」才开始盯，否则每次开机都会白寄一封信。",
                 fg=self.pal["seal"])
 
@@ -8376,12 +8247,14 @@ class SettingsPanel:
             return None, "「连续不见几分钟」要在 %d ~ %d 之间" % (WATCH_GRACE_MIN,
                                                              WATCH_GRACE_MAX)
 
-        title = self.entry_watch.get().strip()
-        if self.var_watch.get() and not title:
+        cls = self.entry_watch.get().strip()
+        if self.var_watch.get() and not cls:
             return None, "开了窗口盯守，得先挑一扇要盯的窗口"
 
+        # 键名仍叫 "title"（沿袭旧版数据文件），**值现在是一个窗口类名**。
+        # 改键名会让老机器上的配置与「共用设置」整段落空，不值得。
         return {"enabled": bool(self.var_watch.get()),
-                "title": title,
+                "title": cls,
                 "interval_min": interval,
                 "grace_min": grace}, None
 
@@ -8768,7 +8641,8 @@ class SettingsPanel:
 
         调用它的入口已经先保存过了，所以拿到的 cfg 与 secret 都是最新的。
         """
-        self._picker = ExportPicker(self.app, self._write_shared)
+        self._picker = ExportPicker(self.app, self._write_shared,
+                                    mask_opt=True)
 
     def _write_shared(self, selection):
         """挑完之后的落地动作：选路径 → 写文件 → 把接下来该干什么讲清楚。"""
@@ -8779,8 +8653,10 @@ class SettingsPanel:
             filetypes=[("设置文件", "*.json"), ("全部文件", "*.*")])
         if not path:
             return                       # 用户取消了，面板留着不动
+        # 脱敏状态从小窗上现读：_confirm 先 close 再回调，对象还在、属性还在。
+        masked = bool(getattr(self._picker, "mask_on", False))
         ok, why = export_shared_config(path, self.app.cfg, self.app.secret,
-                                       selection)
+                                       selection, masked=masked)
         self.close()
         if not ok:
             messagebox.showerror("导出失败", "文件没能写出来：\n%s" % why)
@@ -8789,6 +8665,13 @@ class SettingsPanel:
                           if selection.get(it["key"]))
         left = "、".join(it["label"] for it in SHARED_ITEMS
                          if not selection.get(it["key"])) or "（无）"
+        if masked:
+            tail = ("· 这一份做了脱敏：邮箱授权码、远程设置的密码与令牌都是 ***。\n"
+                    "  可以放心分享或发布到公开场合；导入的机器保留它自己原来的。")
+        else:
+            tail = ("· 文件里可能有你的邮箱授权码、远程密码，是明文：\n"
+                    "  别放进公共网盘、别发到群里。要发公开场合，导出时勾\n"
+                    "  「敏感信息脱敏」再导一份就行。")
         messagebox.showinfo(
             "已导出",
             "设置已导出到：\n%s\n\n"
@@ -8797,9 +8680,9 @@ class SettingsPanel:
             "接下来：把这份文件拷到别的机器上（U 盘、共享都行），在那台机器的\n"
             "设置面板里点「从文件导入…」选中它，设置当场就换过去了。\n\n"
             "· 本机抬头、开机自启不在文件里，每台机器各自设。\n"
-            "· 文件里可能有你的邮箱授权码，是明文：别放进公共网盘、别发到群里。\n"
+            "%s\n"
             "· 这份文件不会被删 —— 它就是母本，留着以后接着用。"
-            % (path, names, left))
+            % (path, names, left, tail))
 
     def _import_shared(self):
         """从文件导入设置（不删文件 —— 这是用户自己挑的那份，可能是母本）。"""
@@ -8844,7 +8727,7 @@ class SettingsPanel:
             "　· 邮箱地址与授权码\n"
             "　· 寄信履历\n"
             "　· 窗口位置与大小\n"
-            "　· 定时关机的网址、窗口盯守的设置与盯守状态\n\n"
+            "　· 定时关机与窗口盯守的设置\n\n"
             "清空后无法撤销（授权码需要重新去邮箱申请）。\n"
             "开机自动运行的设置会保留，不受影响。\n\n"
             "是否继续？",
@@ -9068,7 +8951,7 @@ class ShutdownAlertWindow:
     """
     「马上要关机」那扇问话窗。
 
-    为什么要有它：两个来源（网址取回的时刻 / 倒计时归零）谁先到就关，
+    为什么要有它：两个来源（远程设置里写的时刻 / 倒计时归零）谁先到就关，
     那一刻用户多半不在机器前 —— 但万一他正坐在那儿，得给他一个反悔的
     机会，否则一次「到点」就把他手里的活直接掀了。
 
