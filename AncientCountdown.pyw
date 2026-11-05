@@ -51,7 +51,7 @@ APP_SUB = "ANCIENT COUNTDOWN"
 # 在线升级靠它判断「有没有新版」：两边都是 "主.次" 两段数字，
 # 比较时拆成 (1, 3) 这样的小元组比大小 —— 字符串比会出事，
 # "1.10" < "1.9" 在字符串世界里是成立的，那会让用户升不上去。
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.13.0"
 
 MIN_W, MIN_H = 300, 150          # 窗口最小尺寸
 # 数字字号的下限。宁可让它稍微顶出一点，也不缩到看不清：
@@ -255,6 +255,19 @@ WATCH_DRILL_SEC = 60                     # 「演练」时问话窗等多少秒�
                                          # （真实盯守按 grace_min 分钟；演练是当场看
                                          # 效果，让用户等十分钟就没人肯试了）
 
+# 「窗口现身传信」：盯几个窗口**标题**关键字，哪扇窗一出现就寄一封信。
+# 与盯守（watch）方向相反：那边按类名整串相同盯「消失」，这边按标题
+# 包含盯「出现」—— 应用弹窗（如护肝鹅的「主线任务」）标题稳定，
+# 类名却常是框架通用的（Tk 系全是 TkTopLevel），按标题反而认得准。
+MAILWATCH_STATE_KEY = "mailwatch_state"  # 巡检与寄信状态（存数据文件，重启不重发）
+MAILWATCH_CHECK_SEC = 30                 # 多久看一眼（秒）。弹窗类东西，半分钟内
+                                         # 寄到就算及时；再勤也只是白烧 CPU
+MAILWATCH_COOLDOWN_MIN = 5               # 同一关键字两封信之间的最小间隔（分钟）。
+                                         # 防的是窗口反复弹关弹关把邮箱刷爆；
+                                         # 平常一集弹窗只寄一封，冷却根本轮不到出手
+MAILWATCH_MAX_KEYWORDS = 10              # 最多盯几个关键字（面板一行一个）
+MAILWATCH_KEYWORD_LEN = 60               # 单个关键字最长多少字（标题超长的截掉也无妨）
+
 # 常见邮箱的 SMTP 参数：(显示名, 服务器, 端口, 是否 SSL)
 # 选服务商只填邮箱地址和授权码即可，服务器参数自动带出
 SMTP_PROVIDERS = [
@@ -381,6 +394,17 @@ DEFAULT_CONFIG = {
         # 「窗口下次出现时自动接着盯」是**写死的行为**，没有开关：
         # 无人值守的机器上，一次通报之后当然要接着盯，否则第二次掉线就没人知道了。
         # 落地方式见 finish_watch_alert（处理完一律退回 waiting 那一档）。
+    },
+
+    # 窗口现身传信：盯几个窗口**标题**关键字，哪扇窗一出现就寄一封信。
+    # 与上面的 watch 方向相反：那边按类名整串相同盯「消失」，这边按标题
+    # 包含盯「出现」—— 应用弹窗标题稳定、类名却常是框架通用的，
+    # 按标题包含反而认得准（这是两套判据，刻意不一样，别"统一"掉）。
+    # 关键字列表为空时等于没开，不会寄任何信。
+    "mailwatch": {
+        "enabled": False,
+        "keywords": [],             # 窗口标题关键字，一行一个，出现任意一个就寄信
+        "cooldown_min": 5,          # 同一关键字两封信之间的最小间隔（防反复弹窗骚扰）
     },
 
     # 远程设置：从一个网址取回一份设置，一次配好十几台机器。
@@ -1256,6 +1280,9 @@ SHARED_ITEMS = (
     {"key": "watch", "label": "窗口盯守设置", "default": True,
      "hint": "盯哪扇窗、隔多久看一次、连续不见多久才寄信",
      "drop": (("config", "watch"),)},
+    {"key": "mailwatch", "label": "窗口现身传信", "default": True,
+     "hint": "盯哪几个窗口标题（一出现就寄信）与冷却分钟数",
+     "drop": (("config", "mailwatch"),)},
     {"key": "pins", "label": "锁定与置顶", "default": True,
      "hint": "是否锁定尺寸、是否总在最前",
      "drop": (("config", "locked"), ("config", "always_on_top"))},
@@ -3578,6 +3605,102 @@ def window_present(cls, classes=None):
     return False
 
 
+def mailwatch_keywords_of(raw):
+    """
+    把配置里的关键字整理成干净的清单：去首尾空白、丢空行、去重、限量限长。
+
+    面板上是一行一个关键字，用户手滑多敲几个回车、复制粘贴带出重复，
+    都是常态 —— 这里统一兜住，后面的匹配与决策只认这一份干净的。
+    """
+    out = []
+    for item in (raw if isinstance(raw, (list, tuple)) else []):
+        kw = re.sub(r"[\r\n\t]+", " ", str(item or "")).strip()
+        if not kw:
+            continue
+        if kw not in out:
+            out.append(kw)
+        if len(out) >= MAILWATCH_MAX_KEYWORDS:
+            break
+    return [kw[:MAILWATCH_KEYWORD_LEN] for kw in out]
+
+
+def match_mailwatch(keywords, entries):
+    """
+    按窗口**标题包含**关键字来认窗。返回 {关键字: (标题, 类名)}（各留首个命中）。
+
+    为什么与盯守的判据不一样、且刻意不统一：
+      · 盯守盯的是「某扇一直在的窗不见了」—— 判据必须经得起换角色、换副本，
+        所以只认类名整串（标题里带角色名，一变就误报）；
+      · 这里盯的是「某个弹窗冒出来了」—— 弹窗标题就是它最稳的身份
+        （「主线任务」不会因为任务不同而变），而它的类名往往是框架通用名
+        （Tk 的弹窗全是 TkTopLevel），整串相同反而谁都匹配不上。
+    包含匹配在这里是安全的：关键字由用户亲手填、指向一个具体弹窗名，
+    不是防冒充的场景。
+    """
+    hits = {}
+    keys = mailwatch_keywords_of(keywords or [])
+    if not keys:
+        return hits
+    for title, cls in (entries or []):
+        t = _squeeze(title)
+        if not t:
+            continue
+        for kw in keys:
+            if kw in hits:
+                continue
+            if _squeeze(kw) and _squeeze(kw) in t:
+                hits[kw] = (title, cls)
+        if len(hits) == len(keys):
+            break
+    return hits
+
+
+def mailwatch_decide(state, keywords, matched_now, now_ts,
+                     cooldown_sec=MAILWATCH_COOLDOWN_MIN * 60):
+    """
+    纯决策：上一轮状态 + 这一轮谁在屏上 → 该给哪些关键字寄信。
+
+    规矩只有三条：
+      1. **第一次见到某个关键字只记基线，不寄信** —— 程序刚启动、或刚加的
+         关键字恰好窗口已经开着，那不是「出现」，寄了就是骚扰（与盯守
+         「先见过才盯」同一个道理，方向相反）。
+      2. 只有「上一轮不在、这一轮在」这个**跳变**才寄 —— 窗户一直开着
+         期间绝不再寄，一集弹窗一封信。
+      3. 同一关键字两封信之间至少隔 cooldown_sec 秒 —— 防弹窗反复弹关
+         把邮箱刷爆。冷却以「寄出的时刻」计，与状态一起落盘，重启不清零。
+
+    state 形如 {"present": {kw: bool}, "sent": {kw: ts}}；返回
+    (要寄的关键字清单, 新状态)。不碰任何全局 —— 所以自检能把它整个测穿。
+    """
+    present = state.get("present") if isinstance(state.get("present"), dict) else {}
+    sent = state.get("sent") if isinstance(state.get("sent"), dict) else {}
+    present = dict(present)
+    sent = dict(sent)
+    keys = mailwatch_keywords_of(keywords)
+    matched = set(matched_now or ())
+    to_send = []
+    for kw in keys:
+        cur = kw in matched
+        prev = present.get(kw)
+        if prev is None:
+            present[kw] = cur            # 基线：只记下「它现在在不在」
+            continue
+        if cur and not prev:
+            try:
+                last = float(sent.get(kw) or 0)
+            except (TypeError, ValueError):
+                last = 0.0
+            if now_ts - last >= cooldown_sec:
+                to_send.append(kw)
+                sent[kw] = now_ts
+        present[kw] = cur
+    # 关键字删掉/改写后，旧账一并清掉 —— 状态不许无上限地长。
+    keep = set(keys)
+    present = dict((k, v) for k, v in present.items() if k in keep)
+    sent = dict((k, v) for k, v in sent.items() if k in keep)
+    return to_send, {"present": present, "sent": sent}
+
+
 def tick_count():
     """开机以来的毫秒数（GetTickCount64，随开机归零）。取不到就返回 0。"""
     if os.name != "nt":
@@ -3637,6 +3760,23 @@ def save_alert_state(st):
     return reg_store_write(ALERT_STATE_KEY, st)
 
 
+def load_mailwatch_state():
+    """「窗口现身传信」的状态：上一轮哪些关键字在屏上、各自上次何时寄过信。"""
+    st = reg_store_read(MAILWATCH_STATE_KEY, {})
+    if not isinstance(st, dict):
+        st = {}
+    st.setdefault("last_probe", 0.0)
+    if not isinstance(st.get("present"), dict):
+        st["present"] = {}          # {关键字: 上一轮在不在屏上}
+    if not isinstance(st.get("sent"), dict):
+        st["sent"] = {}             # {关键字: 上次寄信的时刻（epoch 秒）}
+    return st
+
+
+def save_mailwatch_state(st):
+    return reg_store_write(MAILWATCH_STATE_KEY, st)
+
+
 # --------------------------------------------------------------------------
 # 主窗口
 # --------------------------------------------------------------------------
@@ -3670,6 +3810,7 @@ class CountdownApp:
         # 对启动速度没有可感影响。
         self.shutdown_state = load_shutdown_state()
         self.watch_state = load_watch_state()
+        self.mailwatch_state = load_mailwatch_state()
         self.alert_state = load_alert_state()
         self._settle_shutdown_after_restart()
         self._alert_win = None          # 「窗口不见了」那扇确认窗（真出事时）
@@ -4507,6 +4648,7 @@ class CountdownApp:
         # 而「到点关机」正是这套功能存在的全部理由。
         for label, probe in (("定时关机", self.shutdown_tick),
                              ("窗口盯守", self.watch_tick),
+                             ("窗口现身", self.mailwatch_tick),
                              ("远程设置", self.remote_fetch_tick)):
             try:
                 probe(now)
@@ -6380,11 +6522,12 @@ class CountdownApp:
         return True
 
     def record_alert(self, pend, token, status, error=""):
-        """盯守通知的寄信记录。只留最近 20 条 —— 注册表的值不能无上限地长。"""
+        """盯守/现身通知的寄信记录。只留最近 20 条 —— 注册表的值不能无上限地长。"""
         items = self.alert_state.setdefault("items", [])
         items.append({"token": token, "keyword": pend.get("keyword", ""),
                       "at": _stamp(), "at_ts": time.time(),
                       "status": status, "error": error,
+                      "kind": pend.get("kind") or "disappear",
                       "drill": bool(pend.get("drill"))})
         del items[:-20]
         save_alert_state(self.alert_state)
@@ -6398,16 +6541,18 @@ class CountdownApp:
                 break
         if item is None:
             return
+        appear = item.get("kind") == "appear"
+        label = "窗口现身传信" if appear else "窗口告警"
         if data.get("ok"):
             item["status"] = "sent"
             item["error"] = ""
             item["sent_at"] = _stamp()
-            self.set_notify_note("窗口告警已寄出")
+            self.set_notify_note("%s已寄出" % label)
         else:
             message = (data.get("error") or "未知错误").strip()
             item["status"] = "failed"
             item["error"] = message
-            self.set_notify_note("窗口告警寄送失败：%s" % message[:48])
+            self.set_notify_note("%s寄送失败：%s" % (label, message[:48]))
         save_alert_state(self.alert_state)
 
     def watch_status_text(self):
@@ -6430,6 +6575,131 @@ class CountdownApp:
             return "窗口不见了，问话窗还开着（还有 %d 分 %d 秒自动寄信，" \
                    "它再出现就撤销）" % (left // 60, left % 60)
         return "等「%s」出现" % keyword
+
+    # ---------------- 窗口现身传信（出现就寄信）----------------
+    #
+    # 与盯守同一套邮件管道（mailer 进程、传书记录、本机抬头），只是方向
+    # 相反：盯守等「消失」，这里等「出现」。判据也不同 —— 标题包含关键字
+    # （见 match_mailwatch 的注释）。状态与决策的核心逻辑全部抽成纯函数
+    # （mailwatch_decide），这里只做三件杂活：限频、枚举窗口、派信。
+
+    def mailwatch_cfg(self):
+        cfg = self.cfg.get("mailwatch")
+        if not isinstance(cfg, dict):
+            cfg = {}
+        return dict(DEFAULT_CONFIG["mailwatch"], **cfg)
+
+    def mailwatch_keywords(self):
+        return mailwatch_keywords_of(self.mailwatch_cfg().get("keywords"))
+
+    def mailwatch_tick(self, now):
+        """每 MAILWATCH_CHECK_SEC 秒看一眼：谁刚冒出来，就给谁寄一封信。"""
+        cfg = self.mailwatch_cfg()
+        kws = self.mailwatch_keywords()
+        if not cfg.get("enabled") or not kws:
+            return
+        st = self.mailwatch_state
+        clock = now.timestamp()
+        if clock - float(st.get("last_probe") or 0) < MAILWATCH_CHECK_SEC:
+            return
+        st["last_probe"] = clock
+
+        try:
+            cooldown_min = float(cfg.get("cooldown_min")
+                                 if cfg.get("cooldown_min") is not None
+                                 else MAILWATCH_COOLDOWN_MIN)
+        except (TypeError, ValueError):
+            cooldown_min = MAILWATCH_COOLDOWN_MIN
+        cooldown = max(0.0, cooldown_min) * 60.0
+
+        hits = match_mailwatch(kws, list_window_entries())
+        to_send, new = mailwatch_decide(st, kws, set(hits), clock,
+                                        cooldown_sec=cooldown)
+        st.update(new)
+        save_mailwatch_state(st)
+        for kw in to_send:
+            title, cls = hits.get(kw) or ("", "")
+            self.send_appear_mail(kw, title, cls)
+
+    def send_appear_mail(self, kw, title="", cls="", drill=False):
+        """
+        「窗口现身」的信。邮箱设置照旧用「传书」里那一套 —— 同一台机器
+        没有理由配两个发件邮箱。演练的那封主题正文都写明是演练。
+        """
+        kw = re.sub(r"[\r\n]+", " ", str(kw or "")).strip()[:MAILWATCH_KEYWORD_LEN]
+        title = str(title or "").strip()
+        cls = str(cls or "").strip()
+        if drill:
+            lines = [
+                "这是一封演练信：你在设置面板里点了「试一遍」。",
+                "那扇窗并没有真的出现 —— 收到就不用管，说明链路是通的。",
+                "",
+            ]
+        else:
+            lines = ["你盯的那个窗口出现了。", ""]
+        lines += [
+            "窗口关键字　%s" % (kw or "（未命名）"),
+        ]
+        if title:
+            lines.append("窗口标题　　%s" % title[:80])
+        if cls:
+            lines.append("窗口类名　　%s" % cls[:60])
+        lines.append("发现时间　　%s" % _stamp())
+        if not drill:
+            lines.append("（它一出现就寄这一封；一直开着不重发，关掉再弹才会再寄）")
+        sign = self.notify_signature()
+        if sign:
+            lines.append("寄出机器　%s" % sign)
+        lines += self.mail_footer()
+        body = "\n".join(lines)
+        if len(body.encode("utf-8")) > NOTIFY_BODY_LIMIT:
+            body = body.encode("utf-8")[:NOTIFY_BODY_LIMIT].decode("utf-8", "ignore")
+
+        pend = {"keyword": kw or "（未命名）", "kind": "appear", "drill": drill,
+                "at": _stamp()}
+        if not self.notify_configured():
+            self.record_alert(pend, "", "failed", "邮箱还没配好")
+            self.set_notify_note(("演练发不出去：" if drill else "窗口出现了，但")
+                                 + "邮箱还没配好，没能寄信")
+            return False
+
+        token = "appear-%s-%d" % (_stamp("%H%M%S"), random.randint(100, 999))
+        subject = "窗口现身（演练）：%s" % kw if drill else "窗口现身：%s" % kw
+        ok, err = self._spawn_mailer(token, self.mail_subject(subject), body)
+        if not ok:
+            self.record_alert(pend, token, "failed", err)
+            self.set_notify_note(("演练信没寄出去：" if drill else "现身传信没寄出去：")
+                                 + err)
+            return False
+        self.record_alert(pend, token, "sending", "")
+        self.set_notify_note("窗口出现了，正在寄信告知…" if not drill
+                             else "正在寄演练信…")
+        return True
+
+    def mailwatch_drill(self, kw=None):
+        """「试一遍」：假装某个关键字刚命中，真寄一封标注为演练的信。"""
+        kw = (kw or "").strip() or (self.mailwatch_keywords() or ["（演练窗口）"])[0]
+        return self.send_appear_mail(kw, "（演练）这扇窗并没有真的出现",
+                                     "（演练）", drill=True)
+
+    def mailwatch_status_text(self):
+        """现身传信现在是什么状况，一句人话（设置面板的状态行用它）。"""
+        cfg = self.mailwatch_cfg()
+        kws = self.mailwatch_keywords()
+        if not cfg.get("enabled"):
+            return "未开启"
+        if not kws:
+            return "还没填要盯的窗口名"
+        present = (self.mailwatch_state.get("present") or {}) \
+            if isinstance(self.mailwatch_state.get("present"), dict) else {}
+        on = [k for k in kws if present.get(k)]
+        wait = [k for k in kws if not present.get(k)]
+        parts = []
+        if on:
+            parts.append("在屏上：%s" % "、".join(on))
+        if wait:
+            parts.append("等出现：%s" % "、".join(wait))
+        return "盯 %d 个关键字（%s）" % (len(kws), "；".join(parts))
 
     # ---------------- 设置面板 ----------------
 
@@ -7087,6 +7357,7 @@ class SettingsPanel:
         self._build_window(self.col_r)
         self._build_notify(self.col_r)
         self._build_watch(self.col_r)
+        self._build_mailwatch(self.col_r)
 
     def _on_inner_resize(self, _event=None):
         """内容高度变了（折行重排、加了一条规则……）就刷新滚动范围与滑块。"""
@@ -8578,6 +8849,7 @@ class SettingsPanel:
             if not self.win.winfo_exists():
                 return
             self._sync_watch_status()
+            self._sync_mailwatch_status()
             self._sync_shutdown_note()
             self.win.after(1000, self._poll_watch)
         except tk.TclError:
@@ -8610,6 +8882,174 @@ class SettingsPanel:
                 "title": cls,
                 "interval_min": interval,
                 "grace_min": grace}, None
+
+    def _build_mailwatch(self, parent):
+        """
+        窗口现身传信：盯几个窗口标题关键字，哪扇窗一出现就寄一封信。
+
+        与「窗口盯守」是姊妹功能但判据刻意不同（那边类名整串、这边标题包含），
+        理由见 match_mailwatch 的注释 —— 弹窗的类名是框架通用名，只有标题稳。
+        """
+        app, pal = self.app, self.pal
+        mc = app.mailwatch_cfg()
+
+        head = self._section("窗口现身传信", parent)
+        tk.Label(head, text="一出现就寄信", bg=pal["paper"], fg=pal["ink_soft"],
+                 font=(app.fam_cn, 9)).pack(side="right")
+
+        wrap = tk.Frame(parent, bg=pal["paper"])
+        wrap.pack(fill="x", padx=18)
+
+        self.var_mwatch = tk.BooleanVar(value=bool(mc.get("enabled")))
+        self._wrap(tk.Checkbutton(wrap, text="  盯几个窗口，出现任意一扇就寄一封信",
+                                  variable=self.var_mwatch, bg=pal["paper"],
+                                  fg=pal["ink"], selectcolor="#FFFBF2",
+                                  activebackground=pal["paper"],
+                                  activeforeground=pal["seal"],
+                                  font=(app.fam_cn, 10), anchor="w",
+                                  justify="left", bd=0,
+                                  highlightthickness=0), 56).pack(fill="x")
+
+        row = tk.Frame(wrap, bg=pal["paper"])
+        row.pack(fill="x", pady=(6, 0))
+        self.txt_mwatch = tk.Text(row, height=2, font=(app.fam_cn, 10),
+                                  bg="#FFFBF2", fg=pal["ink"], relief="flat",
+                                  insertbackground=pal["seal"], wrap="word",
+                                  highlightthickness=1,
+                                  highlightbackground=pal["border_soft"],
+                                  highlightcolor=pal["seal"])
+        for kw in app.mailwatch_keywords():
+            self.txt_mwatch.insert("end", kw + "\n")
+        self.txt_mwatch.pack(fill="x", ipady=2)
+
+        self._wrap(tk.Label(wrap,
+                            text="　窗口名一行一个；按窗口标题包含关键字来认（不分大小写与空白），"
+                                 "适合标题稳定的弹窗（如「主线任务」）。与上面的盯守方向相反 —— "
+                                 "那边按类名盯「消失」，这边按标题盯「出现」。",
+                            bg=pal["paper"], fg=pal["border"], font=(app.fam_cn, 9),
+                            anchor="w", justify="left"), 40).pack(fill="x", pady=(2, 0))
+
+        bar = tk.Frame(wrap, bg=pal["paper"])
+        bar.pack(fill="x", pady=(6, 0))
+        probe = tk.Label(bar, text="看一眼现在匹配到哪些", bg=pal["paper"], fg=pal["ink"],
+                         font=(app.fam_cn, 10), cursor="hand2",
+                         padx=12, pady=3, highlightthickness=1,
+                         highlightbackground=pal["border_soft"])
+        probe.pack(side="left")
+        probe.bind("<Button-1>", lambda e: self._probe_mailwatch_now())
+        probe.bind("<Enter>", lambda e: probe.configure(fg=pal["seal"]))
+        probe.bind("<Leave>", lambda e: probe.configure(fg=pal["ink"]))
+
+        drill = tk.Label(bar, text="试一遍（真寄一封演练信）", bg="#FFFBF2",
+                         fg=pal["seal"], font=(app.fam_cn, 10, "bold"),
+                         cursor="hand2", padx=12, pady=3,
+                         highlightthickness=1, highlightbackground=pal["seal"])
+        drill.pack(side="left", padx=(8, 0))
+        drill.bind("<Button-1>", lambda e: self._drill_mailwatch_now())
+        drill.bind("<Enter>", lambda e: drill.configure(bg=pal["seal"], fg="#FFF8EC"))
+        drill.bind("<Leave>", lambda e: drill.configure(bg="#FFFBF2", fg=pal["seal"]))
+
+        # 提示与状态共用一行：探测/演练的提示要留 12 秒（给用户看清），
+        # 期间每秒的状态刷新绕行 —— 不然刚点完「看一眼」就被状态行盖掉。
+        # 面板右列的高度余量只有几十像素，能省一行是一行。
+        self._mwatch_msg_until = 0.0
+        self.mwatch_msg = self._wrap(tk.Label(wrap, text="", bg=pal["paper"],
+                                              fg=pal["ink_soft"], font=(app.fam_cn, 9),
+                                              anchor="w", justify="left"), 40)
+        self.mwatch_msg.pack(fill="x", pady=(4, 0))
+
+        if not app.notify_configured():
+            self._wrap(tk.Label(wrap, text="　⚠ 上面的「传书」还没配好邮箱，"
+                                           "窗口出现了也寄不出去。",
+                                bg=pal["paper"], fg=pal["seal"], font=(app.fam_cn, 9),
+                                anchor="w", justify="left"), 40).pack(fill="x", pady=(2, 0))
+
+        self._sync_mailwatch_status()
+
+    def _mwatch_lines(self):
+        """把输入框里的关键字按行读出来（不整理，整理交给 mailwatch_keywords_of）。"""
+        try:
+            return self.txt_mwatch.get("1.0", "end").splitlines()
+        except tk.TclError:
+            return []
+
+    def _probe_mailwatch_now(self):
+        """立刻按框里现在的关键字匹配一遍，让用户当场知道认不认得出那扇窗。"""
+        kws = mailwatch_keywords_of(self._mwatch_lines())
+        if not kws:
+            self.mwatch_msg_configure("先填至少一个窗口名（一行一个）", seal=True)
+            return
+        hits = match_mailwatch(kws, list_window_entries())
+        if hits:
+            self.mwatch_msg_configure(
+                "现在在屏上：%s（命中的就是这些窗，出现即寄信）"
+                % "、".join((_t[:24] or ("类名 %s" % c[:20])) for _t, c in hits.values()),
+                fg="#4F7A52")
+        else:
+            self.mwatch_msg_configure(
+                "现在没有窗口匹配这些关键字。若那个弹窗本来就没弹，这是正常的。",
+                seal=True)
+
+    def _drill_mailwatch_now(self):
+        """「试一遍」：真寄一封标注为演练的现身信，验证整条链路。"""
+        kws = mailwatch_keywords_of(self._mwatch_lines())
+        if not kws:
+            self.mwatch_msg_configure("先填至少一个窗口名（演练也拿它当信里的名字）",
+                                      seal=True)
+            return
+        if not self.app.notify_configured():
+            self.mwatch_msg_configure(
+                "邮箱还没配好，演练也发不出去 —— 先去「传书」那一节把邮箱填上。",
+                seal=True)
+            return
+        ok = self.app.mailwatch_drill(kws[0])
+        if ok:
+            self.mwatch_msg_configure(
+                "演练信已交给发信进程，主题带「演练」二字，收到即链路通。",
+                fg="#4F7A52")
+        else:
+            self.mwatch_msg_configure("演练信没寄出去，看「传书」里的最近一句话。",
+                                      seal=True)
+
+    def mwatch_msg_configure(self, text, fg=None, seal=False):
+        """现身传信那行的统一出口：提示与每秒状态共用一行，提示先留 12 秒。"""
+        if not hasattr(self, "mwatch_msg"):
+            return
+        try:
+            self.mwatch_msg.configure(
+                text=text, fg=fg or (self.pal["seal"] if seal else self.pal["ink_soft"]))
+            self._mwatch_msg_until = time.time() + 12.0
+        except tk.TclError:
+            pass
+
+    def _sync_mailwatch_status(self):
+        if not hasattr(self, "mwatch_msg"):
+            return
+        try:
+            if time.time() < getattr(self, "_mwatch_msg_until", 0.0):
+                return          # 提示还留着，别让状态行把它盖掉
+            self.mwatch_msg.configure(
+                text="　现在：%s" % self.app.mailwatch_status_text(),
+                fg=self.pal["ink_soft"])
+        except tk.TclError:
+            pass
+
+    def _collect_mailwatch(self):
+        kws = mailwatch_keywords_of(self._mwatch_lines())
+        raw_count = len([ln for ln in self._mwatch_lines() if ln.strip()])
+        if raw_count > MAILWATCH_MAX_KEYWORDS:
+            return None, "窗口名最多盯 %d 个" % MAILWATCH_MAX_KEYWORDS
+        if self.var_mwatch.get() and not kws:
+            return None, "开了窗口现身传信，至少得填一个窗口名"
+        # 冷却分钟数面板上没有入口（配置文件里改），原样保留
+        mc = self.app.mailwatch_cfg()
+        try:
+            cooldown = float(mc.get("cooldown_min") or MAILWATCH_COOLDOWN_MIN)
+        except (TypeError, ValueError):
+            cooldown = float(MAILWATCH_COOLDOWN_MIN)
+        return {"enabled": bool(self.var_mwatch.get()),
+                "keywords": kws,
+                "cooldown_min": cooldown}, None
 
     def _build_shared(self, parent):
         """
@@ -8955,6 +9395,10 @@ class SettingsPanel:
         if err:
             self.msg.configure(text=err)
             return
+        mwatch_cfg, err = self._collect_mailwatch()
+        if err:
+            self.msg.configure(text=err)
+            return
         remote_cfg, remote_creds, err = self._collect_remote()
         if err:
             self.msg.configure(text=err)
@@ -8978,6 +9422,7 @@ class SettingsPanel:
                                       notify_cfg, secret,
                                       extra_cfg={"shutdown": shut_cfg,
                                                  "watch": watch_cfg,
+                                                 "mailwatch": mwatch_cfg,
                                                  "remote": remote_cfg})
         if err:
             self.msg.configure(text=err)
