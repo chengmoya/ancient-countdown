@@ -51,7 +51,7 @@ APP_SUB = "ANCIENT COUNTDOWN"
 # 在线升级靠它判断「有没有新版」：两边都是 "主.次" 两段数字，
 # 比较时拆成 (1, 3) 这样的小元组比大小 —— 字符串比会出事，
 # "1.10" < "1.9" 在字符串世界里是成立的，那会让用户升不上去。
-APP_VERSION = "1.13.3"
+APP_VERSION = "1.13.4"
 
 MIN_W, MIN_H = 300, 150          # 窗口最小尺寸
 # 数字字号的下限。宁可让它稍微顶出一点，也不缩到看不清：
@@ -8205,14 +8205,9 @@ class SettingsPanel:
         cfg.update({"enabled": enabled, "url": url, "auth": mode,
                     "user": self.entry_ruser.get().strip(),
                     "refresh_min": minutes})
-        # 「随远程」勾选框（窗口节位置行里那个，v1.13.3）：与「挑同步哪些项」
-        # 里的「窗口位置」写的是同一个键（remote.items.winpos）。在这儿收口
-        # 而不是勾选时立刻写盘，是跟面板其它勾选框保持一个规矩 —— 都以
-        # 「保存」按钮为准，不点保存就关面板，什么都不会变。
-        if hasattr(self, "var_winpos"):
-            items = dict(cfg.get("items") or {})
-            items["winpos"] = bool(self.var_winpos.get())
-            cfg["items"] = items
+        # 窗口位置跟不跟远程（remote.items.winpos）只有一个入口：
+        # 「挑同步哪些项…」清单里的「窗口位置」，在 _save_remote_items 里
+        # 收口 —— 位置行这里不再放单独开关（2026-11-05 用户定夺：一个入口够）。
         creds = {"remote_password": self.entry_rpass.get(),
                  "remote_token": self.entry_rtoken.get().strip(),
                  "remote_header_name": self.entry_rhname.get().strip(),
@@ -8271,7 +8266,8 @@ class SettingsPanel:
             persist=self._save_remote_items)
 
     def _save_remote_items(self, selection):
-        """挑完把结果记进配置（跟着「保存」一起落盘）。"""
+        """挑完把结果记进配置（跟着「保存」一起落盘）。窗口位置（winpos）
+        也只有这一个入口 —— 收口就在这里，别处不再碰这个键。"""
         cfg = self.app.remote_cfg()
         cfg["items"] = dict((k, bool(v)) for k, v in selection.items())
         self.app.cfg["remote"] = cfg
@@ -8399,11 +8395,10 @@ class SettingsPanel:
         row.pack_configure(pady=(0, 3))
 
         # 位置行：与尺寸行同款（用户提的 —— 尺寸能填数字了，位置却只能拖，
-        # 想精确摆到某个落点没处填）。「随远程」是行内小勾选框，与「挑同步
-        # 哪些项」里的「窗口位置」写的是同一个键：勾上＝位置按远程下发的
-        # 坐标统一摆放（本机改了也会在下一次拉取时被母本的坐标盖回来），
-        # 不勾＝这台机器自己定。做成行内而不占一整行，是因为右列高度余量
-        # 只剩几十像素 —— 2026-11-05 为塞下「现身传信」那一节已经裁过一轮。
+        # 想精确摆到某个落点没处填）。位置跟不跟远程不放本行开关 —— 只有
+        # 「挑同步哪些项…」清单里的「窗口位置」一个入口（2026-11-05 用户
+        # 定夺）：勾上＝位置按远程下发的坐标统一摆放（本机改了也会在下一次
+        # 拉取时被母本的坐标盖回来），不勾＝这台机器自己定。
         prow = tk.Frame(parent, bg=pal["paper"])
         prow.pack(fill="x", padx=18, pady=(0, 3))
 
@@ -8443,27 +8438,14 @@ class SettingsPanel:
         pos_btn.bind("<Enter>", lambda e: pos_btn.configure(fg=pal["seal"]))
         pos_btn.bind("<Leave>", lambda e: pos_btn.configure(fg=pal["ink_soft"]))
 
-        self.var_winpos = tk.BooleanVar(value=self._winpos_sync_now())
-        tk.Checkbutton(prow, text=" 随远程", variable=self.var_winpos,
-                       bg=pal["paper"], fg=pal["ink_soft"],
-                       selectcolor="#FFFBF2", activebackground=pal["paper"],
-                       activeforeground=pal["seal"], font=(app.fam_cn, 9),
-                       bd=0, highlightthickness=0).pack(side="left", padx=(8, 0))
-
-        self._wrap(tk.Label(parent, text="　大小、位置都能直接拖；勾「随远程」＝位置按远程下发的坐标统一摆放。",
+        self._wrap(tk.Label(parent, text="　大小、位置都能直接拖；位置要不要跟远程统一，在"
+                            "「挑同步哪些项…」里勾「窗口位置」。",
                             bg=pal["paper"], fg=pal["border"],
                             font=(app.fam_cn, 9), anchor="w", justify="left"), 40).pack(
             fill="x", padx=18, pady=(0, 3))
 
         self._sync_size()
         self._poll_size()
-
-    def _winpos_sync_now(self):
-        """「随远程」勾选框的当前值：本机 remote.items.winpos；没写过按默认（勾）。"""
-        items = self.app.remote_cfg().get("items")
-        if isinstance(items, dict) and "winpos" in items:
-            return bool(items.get("winpos"))
-        return bool(default_remote_selection().get("winpos"))
 
     def _sync_size(self):
         """把主窗口当前尺寸、位置填进四个输入框。用户正在编辑时不动，免得打断他。"""
