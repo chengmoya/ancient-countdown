@@ -51,7 +51,7 @@ APP_SUB = "ANCIENT COUNTDOWN"
 # 在线升级靠它判断「有没有新版」：两边都是 "主.次" 两段数字，
 # 比较时拆成 (1, 3) 这样的小元组比大小 —— 字符串比会出事，
 # "1.10" < "1.9" 在字符串世界里是成立的，那会让用户升不上去。
-APP_VERSION = "1.13.2"
+APP_VERSION = "1.13.3"
 
 MIN_W, MIN_H = 300, 150          # 窗口最小尺寸
 # 数字字号的下限。宁可让它稍微顶出一点，也不缩到看不清：
@@ -5053,6 +5053,26 @@ class CountdownApp:
         self._remember_geometry()
         return ""
 
+    def move_to(self, x, y):
+        """
+        按给定坐标挪窗口（设置面板里「位置」那格的「应用」走这里）。
+        返回错误文本；空串 = 挪好了。
+
+        与 resize_to 是一对：尺寸早就能填数字了，位置却只能靠拖 ——
+        想精确摆到某个落点（远程下发坐标之外的手动摆法）没处填。
+        坐标会夹回当前屏幕可视区：这批机器都是单屏，填出界了窗口会
+        整个消失，夹回来比让用户满屏幕找窗口强。「锁定窗口尺寸」
+        管的是宽高，不拦挪位置 —— 拖动挪位置也从没被拦过。
+        """
+        try:
+            x, y = int(float(x)), int(float(y))
+        except (TypeError, ValueError):
+            return "位置要填数字"
+        nx, ny, _ = self.clamp_position(x, y, self.w, self.h)
+        self._apply_geometry(nx, ny, self.w, self.h)
+        self._remember_geometry()
+        return ""
+
     def reset_position(self):
         """把窗口挪回默认位置——万一它跑到屏幕外，靠这个救回来。"""
         x, y = self.default_position()
@@ -7014,8 +7034,8 @@ class CountdownApp:
         """
         从注册表重新读一遍设置，并把窗口按新设置刷新（不重启程序）。
 
-        和 factory_reset 的刷新段是同一套路子，但不清数据、不挪窗口位置 ——
-        换的是配色、目标时刻、颜色规则、邮箱设置这些「设置类」的东西。
+        和 factory_reset 的刷新段是同一套路子，但不清数据；窗口的大小与
+        位置都按新存档落位（位置在 v1.13.2 前刻意不动，见下面那段）。
         """
         self.cfg = load_config()
         self.secret = load_notify_secret()
@@ -7045,12 +7065,27 @@ class CountdownApp:
         self.root.configure(bg=pal["ink"])
         self.canvas.configure(bg=pal["paper"])
         self.root.attributes("-topmost", bool(self.cfg.get("always_on_top", True)))
-        # 尺寸也按新配置来（窗口位置保持不变：导入进来的坐标属于别的机器，
-        # 硬套到本机反而会把窗口甩到屏幕外）
+        # 尺寸照旧按新配置来；位置见下面那段（v1.13.3 起跟着存档走）。
         self.w = min(max(MIN_W, int((self.cfg.get("window") or {}).get("w") or 620)),
                      max(MIN_W, self.root.winfo_screenwidth()))
         self.h = min(max(MIN_H, int((self.cfg.get("window") or {}).get("h") or 300)),
                      max(MIN_H, self.root.winfo_screenheight()))
+        # 位置：以前刻意不动（「导入进来的坐标属于别的机器」）—— 那是
+        # 「窗口位置」默认**不**跟远程同步时的老规矩。v1.13.2 起位置默认
+        # 跟随（用户明确全线分辨率一致、要统一摆放），再守老规矩就成了
+        # 「存档里坐标换了、窗口纹丝不动，重启才落位」，5 分钟一拉的同步
+        # 名存实亡（2026-11-05 用户当场抓到）。改成：存档落点与本机当前
+        # 不同才当场重摆 —— _place_window 自带出界救援，救援结果不落盘；
+        # 一致就一根手指都不动，绝不为挪而挪（不然每次拉取窗口都要白闪
+        # 一下）。用户正拖在手里时忍一手：拖到一半窗口自己跑了像闹鬼。
+        _win = self.cfg.get("window") or {}
+        try:
+            _rx, _ry = int(_win.get("x")), int(_win.get("y"))
+        except (TypeError, ValueError):
+            _rx = _ry = None
+        if (not self._dragging and _rx is not None
+                and (_rx, _ry) != (self.x, self.y)):
+            self._place_window()
         self.root.deiconify()
         self.root.lift()
         self._restore_chrome()
@@ -7468,7 +7503,9 @@ class SettingsPanel:
         sh = self.win.winfo_screenheight()
         wmin = min(SettingsPanel.MIN_W, max(360, sw - 60))
         hmin = min(SettingsPanel.MIN_H, max(200, sh - 120))
-        return (wmin, max(wmin, sw - 100), hmin, max(hmin, sh - 90))
+        # 高度上限：屏幕高 - 64（v1.13.3 从 90 放宽 —— 「窗口」节加了
+        # 一行「位置」，右列内容跟着长高；任务栏一般占 40~48px，仍碰不到）
+        return (wmin, max(wmin, sw - 100), hmin, max(hmin, sh - 64))
 
     def _fit_height(self):
         """
@@ -8168,6 +8205,14 @@ class SettingsPanel:
         cfg.update({"enabled": enabled, "url": url, "auth": mode,
                     "user": self.entry_ruser.get().strip(),
                     "refresh_min": minutes})
+        # 「随远程」勾选框（窗口节位置行里那个，v1.13.3）：与「挑同步哪些项」
+        # 里的「窗口位置」写的是同一个键（remote.items.winpos）。在这儿收口
+        # 而不是勾选时立刻写盘，是跟面板其它勾选框保持一个规矩 —— 都以
+        # 「保存」按钮为准，不点保存就关面板，什么都不会变。
+        if hasattr(self, "var_winpos"):
+            items = dict(cfg.get("items") or {})
+            items["winpos"] = bool(self.var_winpos.get())
+            cfg["items"] = items
         creds = {"remote_password": self.entry_rpass.get(),
                  "remote_token": self.entry_rtoken.get().strip(),
                  "remote_header_name": self.entry_rhname.get().strip(),
@@ -8351,21 +8396,82 @@ class SettingsPanel:
                        lambda e: apply_btn.configure(fg=pal["seal"]))
         apply_btn.bind("<Leave>",
                        lambda e: apply_btn.configure(fg=pal["ink_soft"]))
+        row.pack_configure(pady=(0, 3))
 
-        self._wrap(tk.Label(parent, text="　拖窗口边缘也能改；勾了「锁定窗口尺寸」就改不动。",
+        # 位置行：与尺寸行同款（用户提的 —— 尺寸能填数字了，位置却只能拖，
+        # 想精确摆到某个落点没处填）。「随远程」是行内小勾选框，与「挑同步
+        # 哪些项」里的「窗口位置」写的是同一个键：勾上＝位置按远程下发的
+        # 坐标统一摆放（本机改了也会在下一次拉取时被母本的坐标盖回来），
+        # 不勾＝这台机器自己定。做成行内而不占一整行，是因为右列高度余量
+        # 只剩几十像素 —— 2026-11-05 为塞下「现身传信」那一节已经裁过一轮。
+        prow = tk.Frame(parent, bg=pal["paper"])
+        prow.pack(fill="x", padx=18, pady=(0, 3))
+
+        tk.Label(prow, text="位置（X × Y）", bg=pal["paper"], fg=pal["ink"],
+                 font=(app.fam_cn, 10)).pack(side="left")
+
+        self.var_x = tk.StringVar()
+        self.var_y = tk.StringVar()
+        self.entry_x = tk.Entry(prow, textvariable=self.var_x, width=6,
+                                font=(app.fam_num, 11), justify="center",
+                                bg="#FFFBF2", fg=pal["ink"], relief="flat",
+                                insertbackground=pal["seal"],
+                                highlightthickness=1,
+                                highlightbackground=pal["border_soft"],
+                                highlightcolor=pal["seal"])
+        self.entry_x.pack(side="left", padx=(8, 0), ipady=2)
+        self.entry_x.bind("<Return>", lambda e: self._apply_position())
+
+        tk.Label(prow, text="×", bg=pal["paper"], fg=pal["ink_soft"],
+                 font=(app.fam_cn, 10)).pack(side="left", padx=6)
+
+        self.entry_y = tk.Entry(prow, textvariable=self.var_y, width=6,
+                                font=(app.fam_num, 11), justify="center",
+                                bg="#FFFBF2", fg=pal["ink"], relief="flat",
+                                insertbackground=pal["seal"],
+                                highlightthickness=1,
+                                highlightbackground=pal["border_soft"],
+                                highlightcolor=pal["seal"])
+        self.entry_y.pack(side="left", ipady=2)
+        self.entry_y.bind("<Return>", lambda e: self._apply_position())
+
+        pos_btn = tk.Label(prow, text="应用", bg=pal["paper"], fg=pal["ink_soft"],
+                           font=(app.fam_cn, 10), cursor="hand2",
+                           padx=8, pady=2, relief="solid", bd=1)
+        pos_btn.pack(side="left", padx=(12, 0))
+        pos_btn.bind("<Button-1>", lambda e: self._apply_position())
+        pos_btn.bind("<Enter>", lambda e: pos_btn.configure(fg=pal["seal"]))
+        pos_btn.bind("<Leave>", lambda e: pos_btn.configure(fg=pal["ink_soft"]))
+
+        self.var_winpos = tk.BooleanVar(value=self._winpos_sync_now())
+        tk.Checkbutton(prow, text=" 随远程", variable=self.var_winpos,
+                       bg=pal["paper"], fg=pal["ink_soft"],
+                       selectcolor="#FFFBF2", activebackground=pal["paper"],
+                       activeforeground=pal["seal"], font=(app.fam_cn, 9),
+                       bd=0, highlightthickness=0).pack(side="left", padx=(8, 0))
+
+        self._wrap(tk.Label(parent, text="　大小、位置都能直接拖；勾「随远程」＝位置按远程下发的坐标统一摆放。",
                             bg=pal["paper"], fg=pal["border"],
                             font=(app.fam_cn, 9), anchor="w", justify="left"), 40).pack(
-            fill="x", padx=18, pady=(0, 6))
+            fill="x", padx=18, pady=(0, 3))
 
         self._sync_size()
         self._poll_size()
 
+    def _winpos_sync_now(self):
+        """「随远程」勾选框的当前值：本机 remote.items.winpos；没写过按默认（勾）。"""
+        items = self.app.remote_cfg().get("items")
+        if isinstance(items, dict) and "winpos" in items:
+            return bool(items.get("winpos"))
+        return bool(default_remote_selection().get("winpos"))
+
     def _sync_size(self):
-        """把主窗口当前尺寸填进两个输入框。用户正在编辑时不动，免得打断他。"""
+        """把主窗口当前尺寸、位置填进四个输入框。用户正在编辑时不动，免得打断他。"""
         if not hasattr(self, "entry_w"):
             return
         try:
-            if self.win.focus_displayof() in (self.entry_w, self.entry_h):
+            if self.win.focus_displayof() in (self.entry_w, self.entry_h,
+                                              self.entry_x, self.entry_y):
                 return
         except (tk.TclError, AttributeError):
             pass
@@ -8375,6 +8481,14 @@ class SettingsPanel:
             self.var_w.set(str(w))
         if self.var_h.get() != str(h):
             self.var_h.set(str(h))
+        # 位置也一样跟着真值走：窗口被拖走、或被远程下发的坐标当场挪动
+        # （reload_from_store，v1.13.3 起），面板上的数字半秒内跟上 ——
+        # 这正是不再需要「取当前」按钮的原因，尺寸行从来就是这么干的。
+        x, y = int(self.app.x), int(self.app.y)
+        if self.var_x.get() != str(x):
+            self.var_x.set(str(x))
+        if self.var_y.get() != str(y):
+            self.var_y.set(str(y))
 
     def _poll_size(self):
         """窗口被拖着改大小时，面板里的数字跟着变（每半秒看一眼，开销可忽略）。"""
@@ -8391,6 +8505,14 @@ class SettingsPanel:
         self._sync_size()
         self.msg.configure(text=err if err else
                            "窗口已改成 %d × %d" % (self.app.w, self.app.h),
+                           fg=self.pal["seal"] if err else self.pal["ink_soft"])
+
+    def _apply_position(self):
+        """「位置（X × Y）」那格的应用：填坐标挪窗口，出界会被夹回可视区。"""
+        err = self.app.move_to(self.var_x.get(), self.var_y.get())
+        self._sync_size()
+        self.msg.configure(text=err if err else
+                           "窗口已挪到 (%d, %d)" % (self.app.x, self.app.y),
                            fg=self.pal["seal"] if err else self.pal["ink_soft"])
 
     # ---- 传书设置 ----
