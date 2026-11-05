@@ -51,7 +51,7 @@ APP_SUB = "ANCIENT COUNTDOWN"
 # 在线升级靠它判断「有没有新版」：两边都是 "主.次" 两段数字，
 # 比较时拆成 (1, 3) 这样的小元组比大小 —— 字符串比会出事，
 # "1.10" < "1.9" 在字符串世界里是成立的，那会让用户升不上去。
-APP_VERSION = "1.13.0"
+APP_VERSION = "1.13.1"
 
 MIN_W, MIN_H = 300, 150          # 窗口最小尺寸
 # 数字字号的下限。宁可让它稍微顶出一点，也不缩到看不清：
@@ -420,7 +420,11 @@ DEFAULT_CONFIG = {
         # header = 自定义请求头（各家对象存储、代码托管爱用这种）
         "auth": "basic",
         "user": "",                 # basic 的用户名（密码与头名称存在凭据里）
-        "refresh_hours": 6.0,       # 每隔几小时拉一次（0 = 只在启动时拉）
+        "refresh_min": 360,         # 每隔几分钟拉一次（0 = 只在启动时拉）。
+                                    # 2026-11-05 傍晚从 refresh_hours（小时）换成
+                                    # 分钟：用户要全线 5 分钟一拉，0.0834 小时
+                                    # 这种数没人看得懂。老键读取时 ×60 迁移，
+                                    # 见 remote_refresh_minutes()。
         "items": {},                # 参与同步的项，{} = 用默认那套
         "last_at": "",              # 下面三个只是给人看的记录，不是设置
         "last_ok": False,
@@ -1200,11 +1204,11 @@ SHARED_NOTE = (
     "  没带的那些，对方机器上原来的设置会原样保留，不会被这里覆盖。\n"
     "· 本机抬头（寄信署名）不在这个文件里，每台机器各自设。\n"
     "· 开机自启也不在里面，那是每台机器自己的事。\n"
-    "· config.remote.refresh_hours 是各机「隔多久来拉一次设置」的间隔。\n"
+    "· config.remote.refresh_min 是各机「隔多久来拉一次设置」的间隔（分钟）。\n"
     "  这份文件放到网址上时，各机拉到会当场按它改自己的间隔、并重新安排\n"
-    "  下一次拉取，不用重启（只认 0.5~168 小时；写 0 不认，那会让全线机器\n"
-    "  都不再自动拉，以后改这份文件也送不过去）。不想跟随的机器可以在\n"
-    "  「挑同步哪些项…」里不勾「拉取间隔」。\n"
+    "  下一次拉取，不用重启（只认 1~10080 分钟，即一星期以内；写 0 不认，\n"
+    "  那会让全线机器都不再自动拉，以后改这份文件也送不过去）。\n"
+    "  不想跟随的机器可以在「挑同步哪些项…」里不勾「拉取间隔」。\n"
     "· 文件里可能有邮箱授权码、远程设置的密码与令牌，是明文。\n"
     "  别放进公共网盘、别发到群里；要发布到公开场合，请在导出时勾选\n"
     "  「敏感信息脱敏」—— 那些凭据会变成 ***，看到它的机器保留自己的。\n"
@@ -1268,15 +1272,16 @@ SHARED_ITEMS = (
     {"key": "remote", "label": "远程设置", "default": True,
      "hint": "从哪个网址取设置、认证方式、隔多久取一次（认证密码与令牌随「邮箱授权码」那一项走）",
      "drop": (("config", "remote"),)},
-    # 拉取间隔单独拆一条（2026-11-05）：母本里 config.remote.refresh_hours
+    # 拉取间隔单独拆一条（2026-11-05）：母本里 config.remote.refresh_min
+    # （傍晚起单位是分钟；老键 refresh_hours 已废，导出不必再带）
     # 本来就在，但远程拉取会把整个 remote 段 pop 掉（安全考虑：远端不能决定
     # 「下次去哪儿取」）。「多久取一次」和「去哪儿取」不是一回事 —— 用户改一次
     # 母本就能调全线频率，值得单独放行；不想跟随的机器在清单里不勾即可。
     # 注意这张表是剔除式的：不勾「远程设置」时整段 remote 先被删掉，
     # 这个文件里也就没有间隔可下发（hint 里写明了）。
     {"key": "pull_interval", "label": "拉取间隔", "default": True,
-     "hint": "母本里隔几小时拉一次；勾上才跟着远端改，不勾则本机自己定（导出时还需勾「远程设置」）",
-     "drop": (("config", "remote", "refresh_hours"),)},
+     "hint": "母本里隔几分钟拉一次；勾上才跟着远端改，不勾则本机自己定（导出时还需勾「远程设置」）",
+     "drop": (("config", "remote", "refresh_min"),)},
     {"key": "watch", "label": "窗口盯守设置", "default": True,
      "hint": "盯哪扇窗、隔多久看一次、连续不见多久才寄信",
      "drop": (("config", "watch"),)},
@@ -1641,32 +1646,64 @@ def shared_last_result():
 REMOTE_TIMEOUT = 20                      # 拉一次最多等这么久
 REMOTE_MAX_BYTES = 512 * 1024            # 设置文件不该超过 512 KB
 
-# 远端能下发的拉取间隔范围（2026-11-05）。面板允许 0~168，远端刻意不给 0：
-# 母本里手滑写个 0，全线机器就再也不自动拉了，以后改母本也收不回来，
-# 只能挨台手工改 —— 这种「一次写错、全线失联」的口子不能开。
-# 下限半小时，免得一个小数把十几台机器一起变成每几秒打一次服务器。
-REMOTE_MIN_REFRESH_HOURS = 0.5
-REMOTE_MAX_REFRESH_HOURS = 168.0
+# 远端能下发的拉取间隔范围，单位**分钟**（2026-11-05 傍晚起；原来叫
+# refresh_hours、半小时下限，用户要全线 5 分钟一拉，索性把单位换成分钟）。
+# 面板允许 0~10080，远端刻意不给 0：母本里手滑写个 0，全线机器就再也不
+# 自动拉了，以后改母本也收不回来，只能挨台手工改 —— 这种「一次写错、
+# 全线失联」的口子不能开。
+# 上限一周；下限 1 分钟：十几台机器每分钟各打一次静态文件毫无压力，
+# 但再往下（每几秒一次）就纯属把服务器当心跳包了，不放行。
+REMOTE_MIN_REFRESH_MIN = 1
+REMOTE_MAX_REFRESH_MIN = 10080
 
 
-def valid_remote_refresh_hours(val):
+def valid_remote_refresh_min(val):
     """
-    远端母本里写的「隔几小时拉一次」能不能用。合法返回 float，否则 None
+    远端母本里写的「隔几分钟拉一次」能不能用。合法返回 float，否则 None
     （None = 这一项当作没写，本机间隔保持原样，绝不让整份配置因此作废）。
 
-    数字字符串也认（人手改 JSON 时常写成 "6"）；空串、布尔值、NaN/∞、
+    数字字符串也认（人手改 JSON 时常写成 "5"）；空串、布尔值、NaN/∞、
     超出范围一律不认。0 特意挡掉，理由见上面常量处的说明。
     """
     if val is None or isinstance(val, bool):
         return None
     try:
-        hours = float(val)
+        minutes = float(val)
     except (TypeError, ValueError):
         return None
     # nan 和 ±∞ 会自然落在这个比较之外，不用额外请 math 出马。
-    if not (REMOTE_MIN_REFRESH_HOURS <= hours <= REMOTE_MAX_REFRESH_HOURS):
+    if not (REMOTE_MIN_REFRESH_MIN <= minutes <= REMOTE_MAX_REFRESH_MIN):
         return None
-    return hours
+    return minutes
+
+
+def remote_refresh_minutes(rm):
+    """
+    本机**当前生效**的拉取间隔（分钟）。读取优先级：
+      ① refresh_min（新键，2026-11-05 傍晚起）—— **键存在就认**，包括 0
+         （「只在启动时拉」是本机的正经语义；远端下发的禁 0 是另一把尺子，
+         见 valid_remote_refresh_min，两把别混用）。
+      ② 老键 refresh_hours × 60 —— 只在**明确写了**老键时认（写了 0 也
+         是语义）；键压根没有是另一回事，不能把「没写」当成 0。
+      ③ 都没有 → 默认 360 分钟（与 DEFAULT_CONFIG 一致）。
+    并存时新键赢：正常机器不会并存 —— 升级时 _migrate_remote_refresh_min
+    会把老值写进新键，之后 refresh_min 就是唯一权威。
+    """
+    if isinstance(rm, dict) and "refresh_min" in rm:
+        try:
+            m = float(rm.get("refresh_min") or 0)
+        except (TypeError, ValueError):
+            m = float("nan")
+        if 0 <= m <= REMOTE_MAX_REFRESH_MIN:
+            return m
+    if isinstance(rm, dict) and "refresh_hours" in rm:
+        try:
+            hours = float(rm.get("refresh_hours") or 0)
+        except (TypeError, ValueError):
+            hours = 0.0
+        if 0 <= hours <= 168:
+            return hours * 60.0
+    return 360.0
 
 
 # 界面上那个下拉框里的名字 → 内部代号。
@@ -1709,7 +1746,7 @@ def remote_item_specs():
         但从网址拉回来的那份不行；apply_remote_config 本来就会把 config.remote
         整个 pop 掉，这里再放进清单只会造成「勾了也没用」的困惑。
         唯一的例外是「拉取间隔」（清单里的独立一项）：那只是「多久去取一次」，
-        不涉及地址和凭据，由 apply_remote_config 单独放行 refresh_hours 一个键。
+        不涉及地址和凭据，由 apply_remote_config 单独放行 refresh_min 一个键。
     """
     return [it for it in SHARED_ITEMS if it["key"] not in ("secret", "remote")]
 
@@ -1807,9 +1844,12 @@ def apply_remote_config(bundle, items=None):
     保证两条路的行为分毫不差。
 
     唯一的例外是「拉取间隔」（2026-11-05）：config.remote 整段照旧剔除
-    （网址、认证方式、凭据绝不让远端碰），但 refresh_hours 这一个键单独
+    （网址、认证方式、凭据绝不让远端碰），但 refresh_min 这一个键单独
     放行 —— 用户改一次母本，全线机器「隔多久来取一次」就跟着变，
     不必挨台改。跟着不跟着由清单里的「拉取间隔」那一项说了算。
+    （2026-11-05 傍晚起单位是分钟、键名 refresh_min；老键 refresh_hours
+    不再从远端收 —— 母本只有一个，改起来容易，各机本机的老值由
+    remote_refresh_minutes() 在读取时迁移。）
     """
     if not isinstance(bundle, dict):
         return False, "取回来的不是一个设置对象"
@@ -1831,13 +1871,13 @@ def apply_remote_config(bundle, items=None):
     # 那等于让远端决定「下次去哪儿取配置」。只把「多久取一次」摘出来，
     # 而且要在 pop 之前摘：过了 pop 就找不着了。
     far_remote = cfg_in.get("remote")
-    far_hours = (far_remote.get("refresh_hours")
-                 if isinstance(far_remote, dict) else None)
+    far_min = (far_remote.get("refresh_min")
+               if isinstance(far_remote, dict) else None)
     cfg_in.pop("remote", None)
     # items=None 是「全带」（老调用与测试走这条）；传了字典时按清单走，
     # 缺键视作不勾 —— 与上面 picked 那套语义保持一致。
-    new_hours = (valid_remote_refresh_hours(far_hours)
-                 if items is None or bool(items.get("pull_interval")) else None)
+    new_min = (valid_remote_refresh_min(far_min)
+               if items is None or bool(items.get("pull_interval")) else None)
 
     problems = _shape_problems(cfg_in, DEFAULT_CONFIG)
     if problems:
@@ -1859,12 +1899,14 @@ def apply_remote_config(bundle, items=None):
     if not isinstance(cur, dict):
         cur = {}
     merged = deep_merge(cur, cfg_in)
-    if new_hours is not None:
+    if new_min is not None:
         # 只动这一个键：本机 remote 段里的 url / auth / user / items /
         # last_* 全须全尾留着，将来往哪儿取仍是这台机器自己说了算。
+        # 老键 refresh_hours 原样留着 —— remote_refresh_minutes() 优先读
+        # 新键，老键从此是摆设，但删它不是这里的职责。
         rm = merged.get("remote")
-        merged["remote"] = dict(rm, refresh_hours=new_hours) \
-            if isinstance(rm, dict) else {"refresh_hours": new_hours}
+        merged["remote"] = dict(rm, refresh_min=new_min) \
+            if isinstance(rm, dict) else {"refresh_min": new_min}
     ok, err = reg_store_write("config", merged)
     if not ok:
         return False, "设置写不进去：%s" % err
@@ -3822,6 +3864,10 @@ class CountdownApp:
         # 静置的是「自动拉」；用户在面板上点「现在就拉」不受这个限制。
         self._remote_fetching = False
         self._remote_next_at = time.time() + REMOTE_FETCH_START_DELAY
+        # 拉取间隔换单位（2026-11-05 傍晚，refresh_hours 小时 → refresh_min
+        # 分钟）：升级第一次启动把老值 ×60 写进新键，只搬一次。必须赶在
+        # 任何 remote_cfg() / 面板 / 拉取调度用到这里的数据之前。
+        self._migrate_remote_refresh_min()
         # 老版本「网址取回的关机时刻」先搬成 at（只搬一次，见那个方法）——
         # 必须赶在下面 _restore_shutdown_at 之前，否则升级完这台机器就不关了。
         self._migrate_site_date_to_at()
@@ -5640,22 +5686,16 @@ class CountdownApp:
         return None
 
     def _schedule_next_remote_fetch(self):
-        """按当前（可能刚被远端改过的）拉取间隔重排下一次自动拉取，返回小时数。"""
-        try:
-            hours = float(self.remote_cfg().get("refresh_hours") or 0)
-        except (TypeError, ValueError):
-            hours = 0.0
-        self._remote_next_at = time.time() + (hours * 3600 if hours > 0
+        """按当前（可能刚被远端改过的）拉取间隔重排下一次自动拉取，返回分钟数。"""
+        minutes = remote_refresh_minutes(self.remote_cfg())
+        self._remote_next_at = time.time() + (minutes * 60 if minutes > 0
                                               else float("inf"))
-        return hours
+        return minutes
 
     def _remote_fetched(self, ok, err, manual, done):
         """拉回来了（在主线程里跑）。"""
         self._remote_fetching = False
-        try:
-            old_hours = float(self.remote_cfg().get("refresh_hours") or 0)
-        except (TypeError, ValueError):
-            old_hours = 0.0
+        old_min = remote_refresh_minutes(self.remote_cfg())
         note = "已按远端的那份设置更新" if ok else (err or "没拉到")
 
         if ok:
@@ -5672,9 +5712,9 @@ class CountdownApp:
         # 重排必须放在 reload_from_store 之后：远端可能刚把「拉取间隔」
         # 改了，先按旧值排的话，改完还得白等一个旧周期才生效（本机原本
         # 填 0「只在启动时拉」时甚至永远等不到下一次）。
-        new_hours = self._schedule_next_remote_fetch()
-        if ok and new_hours != old_hours:
-            note += "；拉取间隔已改为 %g 小时" % new_hours
+        new_min = self._schedule_next_remote_fetch()
+        if ok and new_min != old_min:
+            note += "；拉取间隔已改为 %g 分钟" % new_min
 
         cfg = self.remote_cfg()
         cfg["last_at"] = _stamp()
@@ -5692,8 +5732,8 @@ class CountdownApp:
                 panel._sync_remote_note()
                 # 间隔刚被远端改了的话，面板上那个输入框也得跟着换：
                 # 否则用户照着旧值点一次「保存」，新间隔立刻被盖回去。
-                if new_hours != old_hours and hasattr(panel, "var_rhours"):
-                    panel.var_rhours.set("%g" % new_hours)
+                if new_min != old_min and hasattr(panel, "var_rhours"):
+                    panel.var_rhours.set("%g" % new_min)
             except Exception:                      # noqa: BLE001
                 pass
 
@@ -5784,13 +5824,42 @@ class CountdownApp:
         if cfg.get("last_ok"):
             # 把当前间隔也带上：远端刚把它改了的话，用户在这儿能直接看见，
             # 不用去翻配置文件（间隔是被远端改的，最容易「改了没感觉」）。
-            try:
-                hours = float(cfg.get("refresh_hours") or 0)
-            except (TypeError, ValueError):
-                hours = 0.0
-            tail = ("每 %g 小时拉一次" % hours) if hours > 0 else "只在启动时拉"
+            minutes = remote_refresh_minutes(cfg)
+            tail = ("每 %g 分钟拉一次" % minutes) if minutes > 0 else "只在启动时拉"
             return "%s 成功 · %s" % (when, tail)
         return "%s 失败：%s" % (when, (cfg.get("last_note") or "")[:60])
+
+    def _migrate_remote_refresh_min(self):
+        """
+        把老键 remote.refresh_hours（小时）搬成 refresh_min（分钟），只搬一次。
+
+        2026-11-05 傍晚换单位。为什么不能只靠 remote_refresh_minutes() 的
+        读取回落：load_config 拿 DEFAULT merge 盘上配置，DEFAULT 里有
+        refresh_min=360 —— 盘上只有老键的升级机器，内存里会**同时**出现
+        「DEFAULT 注水的 360」和「盘上的老值」，读函数分不清哪个是用户真实
+        意图，老间隔就被悄悄顶成默认了。所以升级首启把老值**写进新键落盘**，
+        从此 refresh_min 是唯一权威；老键留着不碍事（没人再读它）。
+        返回是否真搬了（自检要看）。
+        """
+        rm = self.cfg.get("remote")
+        if not isinstance(rm, dict):
+            return False
+        if "refresh_min" in rm or "refresh_hours" not in rm:
+            return False                       # 已是新形态 / 从没有过老键
+        try:
+            hours = float(rm.get("refresh_hours") or 0)
+        except (TypeError, ValueError):
+            return False                       # 老键是垃圾值：不动，按默认走
+        if not (0 <= hours <= 168):
+            return False                       # 越界的老值不搬（宁缺毋滥）
+        rm["refresh_min"] = hours * 60.0
+        self.cfg["remote"] = rm
+        ok, _err = save_config(self.cfg)
+        if not ok:
+            # 写不进去也别拦启动：读取函数对「并存」的处理（新键赢）恰好
+            # 会用上刚写的内存值，本进程内行为仍然正确，下次启动再补。
+            return False
+        return True
 
     def _drop_legacy_shutdown_keys(self):
         """
@@ -8018,19 +8087,20 @@ class SettingsPanel:
         # 记事本打开 设置.json），用户找了一圈问「拉取的间隔没有吗」——
         # 不是没有，是藏得太深。0 = 只在启动时拉一次，之后不再自己醒
         # （remote_fetch_tick 认这个语义，见 _remote_fetched 里重排下次的那段）。
+        # 2026-11-05 傍晚起单位是分钟（原先是小时）；老配置里的 refresh_hours
+        # 由 remote_refresh_minutes() 换算出来显示。
         row_h = tk.Frame(wrap, bg=pal["paper"])
         row_h.pack(fill="x", pady=(6, 0))
         tk.Label(row_h, text="拉取间隔", bg=pal["paper"], fg=pal["ink_soft"],
                  font=(app.fam_cn, 10)).pack(side="left")
-        _rh = app.remote_cfg().get("refresh_hours")
-        self.var_rhours = tk.StringVar(
-            value="%g" % float(6 if _rh is None else _rh))
-        tk.Entry(row_h, textvariable=self.var_rhours, width=4, justify="center",
+        _rmin = remote_refresh_minutes(app.remote_cfg())
+        self.var_rhours = tk.StringVar(value="%g" % _rmin)
+        tk.Entry(row_h, textvariable=self.var_rhours, width=6, justify="center",
                  font=(app.fam_num, 10, "bold"), bg="#FFFBF2", fg=pal["ink"],
                  relief="flat", insertbackground=pal["seal"],
                  highlightthickness=1, highlightbackground=pal["border_soft"],
                  highlightcolor=pal["seal"]).pack(side="left", padx=(4, 4), ipady=3)
-        tk.Label(row_h, text="小时（0 ＝ 只在启动时拉）", bg=pal["paper"],
+        tk.Label(row_h, text="分钟（0 ＝ 只在启动时拉）", bg=pal["paper"],
                  fg=pal["ink_soft"], font=(app.fam_cn, 10)).pack(side="left")
 
         bar = tk.Frame(wrap, bg=pal["paper"])
@@ -8081,17 +8151,17 @@ class SettingsPanel:
             return None, None, "勾了「自动从网址取回设置」，请先填写网址"
         if enabled and mode == "basic" and not self.entry_ruser.get().strip():
             return None, None, "认证方式选了「用户名 + 密码」，用户名不能空着"
-        # 拉取间隔：面板上现在有输入框了（v1.11 补的）。0 = 只在启动时拉一次。
+        # 拉取间隔（分钟，2026-11-05 傍晚起；原先单位小时）。0 = 只在启动时拉一次。
         try:
-            hours = float(self.var_rhours.get().strip() or 6)
+            minutes = float(self.var_rhours.get().strip() or 360)
         except ValueError:
-            return None, None, "「拉取间隔」要填数字，可以带小数"
-        if not 0 <= hours <= 168:
-            return None, None, "「拉取间隔」要在 0 ~ 168 之间（一周）"
+            return None, None, "「拉取间隔」要填数字（分钟），可以带小数"
+        if not 0 <= minutes <= 10080:
+            return None, None, "「拉取间隔」要在 0 ~ 10080 之间（一周）"
         cfg = dict(self.app.remote_cfg())
         cfg.update({"enabled": enabled, "url": url, "auth": mode,
                     "user": self.entry_ruser.get().strip(),
-                    "refresh_hours": hours})
+                    "refresh_min": minutes})
         creds = {"remote_password": self.entry_rpass.get(),
                  "remote_token": self.entry_rtoken.get().strip(),
                  "remote_header_name": self.entry_rhname.get().strip(),
