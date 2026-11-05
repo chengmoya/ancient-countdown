@@ -32,6 +32,7 @@ import random
 import re
 import shutil
 import sys
+import threading
 import time
 import winreg
 import tkinter as tk
@@ -50,7 +51,7 @@ APP_SUB = "ANCIENT COUNTDOWN"
 # 在线升级靠它判断「有没有新版」：两边都是 "主.次" 两段数字，
 # 比较时拆成 (1, 3) 这样的小元组比大小 —— 字符串比会出事，
 # "1.10" < "1.9" 在字符串世界里是成立的，那会让用户升不上去。
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.12.0"
 
 MIN_W, MIN_H = 300, 150          # 窗口最小尺寸
 # 数字字号的下限。宁可让它稍微顶出一点，也不缩到看不清：
@@ -187,6 +188,11 @@ UPDATE_GUARD_KEY = "update_guard"        # 更新后的成功启动计数（v1.8
 UPDATE_GUARD_RUNS = 3                    # 稳定启动满几次才把 .old 删掉
 UPDATE_GUARD_DELAY_MS = 60 * 1000        # 启动后满多久才算「这一次启动成功了」
 
+# ---- 静默自动更新（v1.12）----
+AUTO_INSTALL_KEY = "auto_update_install_state"   # 上一次静默更新的结果（冷却与状态行）
+AUTO_INSTALL_COOLDOWN = 24 * 3600                # 失败后冷却一天，不反复下载折腾网络
+UPDATE_FLOW_LOCK = threading.Lock()              # 手动更新与静默更新互斥：同一时刻只许一条链在换 exe
+
 # ---- 定时关机 · 到点执行 ----
 #
 # 场景：机器上挂着游戏，什么时候收工不取决于人，而取决于用户手上那份
@@ -280,6 +286,7 @@ DEFAULT_CONFIG = {
     # 自动检查新版本：默认开着，但用户可以随时在设置面板里关掉。
     # 关掉之后程序不会再主动联网，只剩手动点「检查更新」这一条路。
     "auto_update_check": True,
+    "auto_update_install": False,   # 发现新版本不再询问、自动下载安装（双开关的第二个）
     "window": {"x": None, "y": None, "w": 620, "h": 300},
     # 设置面板自己的尺寸（**和上面那个「主窗口」是两回事，别混**）。
     # 0 = 还没调过，按内容与屏幕算一个默认值。
@@ -1169,6 +1176,11 @@ SHARED_NOTE = (
     "  没带的那些，对方机器上原来的设置会原样保留，不会被这里覆盖。\n"
     "· 本机抬头（寄信署名）不在这个文件里，每台机器各自设。\n"
     "· 开机自启也不在里面，那是每台机器自己的事。\n"
+    "· config.remote.refresh_hours 是各机「隔多久来拉一次设置」的间隔。\n"
+    "  这份文件放到网址上时，各机拉到会当场按它改自己的间隔、并重新安排\n"
+    "  下一次拉取，不用重启（只认 0.5~168 小时；写 0 不认，那会让全线机器\n"
+    "  都不再自动拉，以后改这份文件也送不过去）。不想跟随的机器可以在\n"
+    "  「挑同步哪些项…」里不勾「拉取间隔」。\n"
     "· 文件里可能有邮箱授权码、远程设置的密码与令牌，是明文。\n"
     "  别放进公共网盘、别发到群里；要发布到公开场合，请在导出时勾选\n"
     "  「敏感信息脱敏」—— 那些凭据会变成 ***，看到它的机器保留自己的。\n"
@@ -1232,18 +1244,31 @@ SHARED_ITEMS = (
     {"key": "remote", "label": "远程设置", "default": True,
      "hint": "从哪个网址取设置、认证方式、隔多久取一次（认证密码与令牌随「邮箱授权码」那一项走）",
      "drop": (("config", "remote"),)},
+    # 拉取间隔单独拆一条（2026-11-05）：母本里 config.remote.refresh_hours
+    # 本来就在，但远程拉取会把整个 remote 段 pop 掉（安全考虑：远端不能决定
+    # 「下次去哪儿取」）。「多久取一次」和「去哪儿取」不是一回事 —— 用户改一次
+    # 母本就能调全线频率，值得单独放行；不想跟随的机器在清单里不勾即可。
+    # 注意这张表是剔除式的：不勾「远程设置」时整段 remote 先被删掉，
+    # 这个文件里也就没有间隔可下发（hint 里写明了）。
+    {"key": "pull_interval", "label": "拉取间隔", "default": True,
+     "hint": "母本里隔几小时拉一次；勾上才跟着远端改，不勾则本机自己定（导出时还需勾「远程设置」）",
+     "drop": (("config", "remote", "refresh_hours"),)},
     {"key": "watch", "label": "窗口盯守设置", "default": True,
      "hint": "盯哪扇窗、隔多久看一次、连续不见多久才寄信",
      "drop": (("config", "watch"),)},
     {"key": "pins", "label": "锁定与置顶", "default": True,
      "hint": "是否锁定尺寸、是否总在最前",
      "drop": (("config", "locked"), ("config", "always_on_top"))},
-    {"key": "window", "label": "窗口位置与大小", "default": True,
-     "hint": "各机器屏幕不一样的话可以不带",
+    {"key": "window", "label": "窗口大小", "default": True,
+     "hint": "宽高各机统一",
      "drop": (("config", "window"),)},
-    {"key": "autoupdate", "label": "自动检查更新", "default": True,
-     "hint": "是否开机后自己去找新版本",
-     "drop": (("config", "auto_update_check"),)},
+    {"key": "winpos", "label": "窗口位置", "default": False,
+     "hint": "想让几台机器摆在同一个角落才勾；不勾时摆哪儿各机自己定",
+     "drop": (("config", "window", "x"), ("config", "window", "y"))},
+    {"key": "autoupdate", "label": "自动更新", "default": True,
+     "hint": "自动检查新版本、以及发现就自动安装（两个开关一起搬）",
+     "drop": (("config", "auto_update_check"),
+              ("config", "auto_update_install"))},
 )
 
 # 上次导出勾了哪几项，也记在注册表里（不是用户设置，只是个记忆）
@@ -1316,7 +1341,8 @@ def build_shared_bundle(cfg, secret, selection=None, masked=False):
 
       搬：目标时刻、颜色规则、配色、传书设置（服务商/账号/收件人/档位）、
           远程设置（网址/认证方式/刷新间隔）、定时关机（含 shutdown.at）、窗口盯守、
-          锁定与置顶、窗口大小与位置（具体带哪几项由 selection 定）。
+          锁定与置顶、窗口大小与位置（大小默认带；位置是独立一项、默认不带 ——
+          想让几台机器摆同一个角落得自己勾，具体带哪几项由 selection 定）。
       不搬 notify.signature（本机抬头）—— 各台机器刻意不同，搬过去会把
           对方的抬头冲掉，而抬头恰恰是用户唯一想区分开的东西。
       不搬 autostart —— 它背后是注册表 Run 键里一条带着 exe 完整路径的命令，
@@ -1327,11 +1353,20 @@ def build_shared_bundle(cfg, secret, selection=None, masked=False):
     """
     snap = json.loads(json.dumps(cfg or {}))       # 深拷贝，绝不改调用方的对象
     snap.pop("autostart", None)
+    # 带上导出机器的版本号（2026-10-31）：这份设置被推到远端后，别的机器
+    # 拉到它，拿 app_version 一比就知道「有机器已经升上去了」—— 开着
+    # 自动安装的机器当场静默跟进，十几台机器不用挨个点检查更新。
+    # 老版本程序不认识这个键，deep_merge 收下也无害（没人读它）。
+    snap["app_version"] = str(APP_VERSION)
     # 面板尺寸必须剔掉（2026-10-22 修）：以前它只是不在 SHARED_ITEMS 里，
     # 而这张表是**剔除式**的（没在表里的键照常带走），所以它其实一直跟着
     # 共用设置跑到别的机器上 —— 小屏机器上设置面板会被撑出屏幕，用户连
     # 「✕」都点不到。注释里写的「不会碰它」一直是错的，这里把实现补上。
     snap.pop("panel", None)
+    # 窗口坐标跟勾选走（2026-10-31）：「窗口位置」是独立一项（默认不勾），
+    # 不勾时 selection 剔除机制会把 window 里的 x/y 子键摘掉 —— 摆哪儿是
+    # 每台机器自己的事，以前坐标跟着大小一起跑，十几台机器互相覆盖，
+    # 重启后窗口永远落在「那个固定位置」，就是这儿出的病。
     nd = snap.get("notify")
     if isinstance(nd, dict):
         nd.pop("signature", None)
@@ -1474,6 +1509,9 @@ def apply_shared_config(bundle):
     # 手工编辑过的文件照样能把小屏机器上的面板撑出屏幕。只在 close() 且
     # 真拖过尺寸时才落盘，所以各机的值本来就该各管各的。
     cfg_in.pop("panel", None)
+    # 窗口坐标认文件（2026-10-31 起）：「窗口位置」是导出时的独立勾选项，
+    # 文件里带着坐标 = 导出方明确勾了「想把位置一起搬过去」，导入就采用。
+    # 远程自动拉取那条路才是硬不认坐标 —— 自动的事绝不悄悄挪人家的窗。
     nd = cfg_in.get("notify")
     if isinstance(nd, dict):
         nd.pop("signature", None)
@@ -1576,6 +1614,34 @@ def shared_last_result():
 REMOTE_TIMEOUT = 20                      # 拉一次最多等这么久
 REMOTE_MAX_BYTES = 512 * 1024            # 设置文件不该超过 512 KB
 
+# 远端能下发的拉取间隔范围（2026-11-05）。面板允许 0~168，远端刻意不给 0：
+# 母本里手滑写个 0，全线机器就再也不自动拉了，以后改母本也收不回来，
+# 只能挨台手工改 —— 这种「一次写错、全线失联」的口子不能开。
+# 下限半小时，免得一个小数把十几台机器一起变成每几秒打一次服务器。
+REMOTE_MIN_REFRESH_HOURS = 0.5
+REMOTE_MAX_REFRESH_HOURS = 168.0
+
+
+def valid_remote_refresh_hours(val):
+    """
+    远端母本里写的「隔几小时拉一次」能不能用。合法返回 float，否则 None
+    （None = 这一项当作没写，本机间隔保持原样，绝不让整份配置因此作废）。
+
+    数字字符串也认（人手改 JSON 时常写成 "6"）；空串、布尔值、NaN/∞、
+    超出范围一律不认。0 特意挡掉，理由见上面常量处的说明。
+    """
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        hours = float(val)
+    except (TypeError, ValueError):
+        return None
+    # nan 和 ±∞ 会自然落在这个比较之外，不用额外请 math 出马。
+    if not (REMOTE_MIN_REFRESH_HOURS <= hours <= REMOTE_MAX_REFRESH_HOURS):
+        return None
+    return hours
+
+
 # 界面上那个下拉框里的名字 → 内部代号。
 # 分开存是因为「给人看的话」和「写进配置的代号」将来都可能各自变，
 # 混在一起写死，改一处就会把老配置里的 auth 值读错。
@@ -1615,6 +1681,8 @@ def remote_item_specs():
         这一项在 U 盘导入那条路上是有的（文件是用户自己拷的，他明知故带），
         但从网址拉回来的那份不行；apply_remote_config 本来就会把 config.remote
         整个 pop 掉，这里再放进清单只会造成「勾了也没用」的困惑。
+        唯一的例外是「拉取间隔」（清单里的独立一项）：那只是「多久去取一次」，
+        不涉及地址和凭据，由 apply_remote_config 单独放行 refresh_hours 一个键。
     """
     return [it for it in SHARED_ITEMS if it["key"] not in ("secret", "remote")]
 
@@ -1687,6 +1755,22 @@ def fetch_remote_config(url, auth="none", user="", secret=None,
     return bundle, None
 
 
+def drop_empty_creds(creds):
+    """
+    把凭据里空着的键摘掉：空着没填 ＝ 本机保持原样，不是「清掉」。
+
+    面板上的密码框每次打开都从本机密文现解密回填，正常保存不会是空。
+    会出现空，多半是面板还停留在旧快照（远程拉取/文件导入刚在盘上换过
+    凭据，面板不知道），或者这份快照来自压根没填过的机器 —— 这时一保存
+    就把本机好好存着的密码抹成空串。这种事真出过：用户两台机的密码被
+    抹空，授权码得重新去邮箱后台申请。所以空一律不写。真要清空凭据，
+    走「恢复出厂设置」。
+    """
+    if not isinstance(creds, dict):
+        return {}
+    return dict((k, v) for k, v in creds.items() if v != "")
+
+
 def apply_remote_config(bundle, items=None):
     """
     把远端那份设置应用进来。返回 (是否采用, 说明)。
@@ -1694,6 +1778,11 @@ def apply_remote_config(bundle, items=None):
     只认 config 段 —— notify_secret（邮箱授权码、远程凭据）永远不动。
     勾选剔除、类型筛子、与现有配置合并，全部走和「从 U 盘导入」同一套代码，
     保证两条路的行为分毫不差。
+
+    唯一的例外是「拉取间隔」（2026-11-05）：config.remote 整段照旧剔除
+    （网址、认证方式、凭据绝不让远端碰），但 refresh_hours 这一个键单独
+    放行 —— 用户改一次母本，全线机器「隔多久来取一次」就跟着变，
+    不必挨台改。跟着不跟着由清单里的「拉取间隔」那一项说了算。
     """
     if not isinstance(bundle, dict):
         return False, "取回来的不是一个设置对象"
@@ -1704,12 +1793,24 @@ def apply_remote_config(bundle, items=None):
     cfg_in = json.loads(json.dumps(cfg_in))
     cfg_in.pop("autostart", None)
     cfg_in.pop("panel", None)      # 面板尺寸各机各管各的，见 apply_shared_config
+    # 窗口坐标不在这里硬剔（2026-10-31 起）：认 remote.items 里的「窗口位置」
+    # 勾选项 —— 不勾（默认）时 selection 剔除机制把 x/y 摘掉，远端那份带着
+    # 某台机器的旧坐标也进不来；勾了就是用户明说要让几台机器摆同一个角落。
+    # 以前坐标默认跟着跑、自动拉取悄悄覆盖，重启后窗口永远落在「固定位置」。
     nd = cfg_in.get("notify")
     if isinstance(nd, dict):
         nd.pop("signature", None)
     # 远端绝不能改写本机的「远程设置」本身（网址、认证方式、凭据）——
-    # 那等于让远端决定「下次去哪儿取配置」。
+    # 那等于让远端决定「下次去哪儿取配置」。只把「多久取一次」摘出来，
+    # 而且要在 pop 之前摘：过了 pop 就找不着了。
+    far_remote = cfg_in.get("remote")
+    far_hours = (far_remote.get("refresh_hours")
+                 if isinstance(far_remote, dict) else None)
     cfg_in.pop("remote", None)
+    # items=None 是「全带」（老调用与测试走这条）；传了字典时按清单走，
+    # 缺键视作不勾 —— 与上面 picked 那套语义保持一致。
+    new_hours = (valid_remote_refresh_hours(far_hours)
+                 if items is None or bool(items.get("pull_interval")) else None)
 
     problems = _shape_problems(cfg_in, DEFAULT_CONFIG)
     if problems:
@@ -1731,6 +1832,12 @@ def apply_remote_config(bundle, items=None):
     if not isinstance(cur, dict):
         cur = {}
     merged = deep_merge(cur, cfg_in)
+    if new_hours is not None:
+        # 只动这一个键：本机 remote 段里的 url / auth / user / items /
+        # last_* 全须全尾留着，将来往哪儿取仍是这台机器自己说了算。
+        rm = merged.get("remote")
+        merged["remote"] = dict(rm, refresh_hours=new_hours) \
+            if isinstance(rm, dict) else {"refresh_hours": new_hours}
     ok, err = reg_store_write("config", merged)
     if not ok:
         return False, "设置写不进去：%s" % err
@@ -2787,6 +2894,108 @@ def run_selfupdate_cli():
     return 0
 
 
+def note_auto_install(ok, ver, err=""):
+    """
+    记一笔静默更新的结果：成功是状态行，失败是冷却的起点。
+
+    放注册表而不是内存：冷却必须跨重启作数 —— 程序开开关关很勤，
+    内存里记冷却等于没记，每回启动都去撞一遍下载。
+    """
+    try:
+        reg_store_write(AUTO_INSTALL_KEY, {"ts": time.time(), "ok": bool(ok),
+                                           "ver": str(ver or ""),
+                                           "err": str(err or "")[:200]})
+    except Exception:                        # noqa: BLE001
+        pass                                 # 留痕失败不拦更新本身
+
+
+def silent_install_allowed():
+    """
+    静默安装的「冷却锁」：上次失败还不满一天就别再折腾网络和磁盘。
+    返回 (是否放行, 说明)。上次是成功的、或从没试过，都放行。
+    """
+    rec = reg_store_read(AUTO_INSTALL_KEY, {})
+    if not isinstance(rec, dict) or rec.get("ok"):
+        return True, ""
+    try:
+        last = float(rec.get("ts") or 0)
+    except (TypeError, ValueError):
+        return True, ""
+    if time.time() - last < AUTO_INSTALL_COOLDOWN:
+        return False, "上次自动更新失败还不满一天"
+    return True, ""
+
+
+def _silent_update_flow(reason, info, finish=None):
+    """
+    静默更新本体（同步执行，调用方负责持 UPDATE_FLOW_LOCK 与后台线程）：
+    查 → 门槛复核 → 下载 → 校验 → 解压 → 换装 → 重启，全程零弹窗。
+
+    成败都写进 AUTO_INSTALL_KEY：成功给面板的状态行看，
+    失败兼当 24 小时冷却的起点 —— 不然断网那阵子每回巡检都白下一遍。
+
+    finish 是最后的退场动作，默认当场 os._exit；App 侧传「派回主线程
+    事件循环再退」的版本 —— 后台线程直接杀进程，可能正好打断主线程
+    写到一半的注册表/文件，回主线程退就没有这个时序问题。
+    """
+    import tempfile
+
+    allowed, why = silent_install_allowed()
+    if not allowed:
+        return                               # 冷却中：连查询都不发，安静退场
+    if info is None:
+        info, err = fetch_update_info()
+        if err or not info:
+            note_auto_install(False, "", "查询失败：%s" % (err or "没有返回内容"))
+            return
+    ver = str(info.get("version") or "")
+    # 版本门槛（就是用户说的那把「锁」）：远端给的版本不比本机新，
+    # 无论它是查回来的还是配置里带的，一律不动作 —— 防降级、防同版重装。
+    if not update_available(ver):
+        note_auto_install(True, APP_VERSION, "线上 v%s 不比本机新，无需更新" % ver)
+        return
+    zip_path, err = download_update(info)
+    if not zip_path:
+        note_auto_install(False, ver, "下载失败：%s" % err)
+        return
+    workdir = tempfile.mkdtemp(prefix="anc_upd_auto_")
+    exe, err = extract_exe(zip_path, workdir)
+    if not exe:
+        note_auto_install(False, ver, "解压失败：%s" % err)
+        return
+    # 成功态先落盘再动手：换 exe 与进程退出之间不该再有任何写盘动作。
+    note_auto_install(True, ver, "已切换到 v%s，正在重启（%s）" % (ver, reason))
+    ok, err = install_update(exe)
+    if not ok:
+        note_auto_install(False, ver, str(err or "更新失败"))
+        return
+    # 新版本已经在路上等锁（最多 20 秒），旧进程功成身退。此刻多半在
+    # 后台线程里，sys.exit 的异常会被主循环吞掉，必须用 os._exit。
+    if finish is not None:
+        finish()
+    else:
+        os._exit(0)
+
+
+def run_silent_update(reason, finish=None):
+    """
+    异步发起一次静默更新（远程配置触发等没有现成线程的场景用）。
+    拿不到流程锁（手动更新正忙）就安静放弃 —— 让路，绝不去抢。
+    """
+    def worker():
+        if not UPDATE_FLOW_LOCK.acquire(blocking=False):
+            return
+        try:
+            _silent_update_flow(reason, None, finish=finish)
+        except Exception as exc:             # noqa: BLE001
+            note_auto_install(False, "", "%s：%s" % (type(exc).__name__, exc))
+            log_problem("自动更新", type(exc), exc, exc.__traceback__)
+        finally:
+            UPDATE_FLOW_LOCK.release()
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def _time_error(hour, minute):
     """报错时把用户原样写的数字带回给他，别让他自己回去数第几段填错了。"""
     return "时间需在 0 ~ 23 时 0 ~ 59 分之间，你写的是 %d 时 %d 分" % (hour, minute)
@@ -3643,6 +3852,7 @@ class CountdownApp:
         self.h = min(max(MIN_H, int(win.get("h") or 300)), max(MIN_H, vb - vt))
 
         x, y = win.get("x"), win.get("y")
+        rescued = False
         if x is None or y is None:
             x, y = self.default_position()
         else:
@@ -3656,9 +3866,14 @@ class CountdownApp:
 
         self.x, self.y = int(x), int(y)
         self.cfg.setdefault("window", {})
-        self.cfg["window"].update({"x": self.x, "y": self.y})
-        if persist:
-            save_config(self.cfg)
+        # 被救回的落点是「这一次启动」的临时安排，绝不覆盖存档：
+        # 开机自启动跑得早、副屏还没醒、分辨率还没切过来，都会把好好的
+        # 坐标误判成「屏幕外」。以前落盘 rescue 结果，用户的位置就此
+        # 永久丢失；现在存档原样留着，屏幕就绪后的下一次启动能回原位。
+        if not rescued:
+            self.cfg["window"].update({"x": self.x, "y": self.y})
+            if persist:
+                save_config(self.cfg)
         set_geometry(self.root, self.w, self.h, self.x, self.y)
 
     def _bind_events(self):
@@ -4428,12 +4643,54 @@ class CountdownApp:
                 self.root.after(0, lambda v=ver: self.set_new_version(v))
             except Exception as exc:         # noqa: BLE001
                 note_scan_error(exc)
+            # 自动安装开着的话，就不只点红点了 —— info 已在手，直接静默
+            # 走完下载-校验-换装-重启（仍在后台线程，同步执行即可）。
+            if self.cfg.get("auto_update_install", False):
+                self.try_silent_flow(info, "scan")
 
         import threading
         try:
             threading.Thread(target=worker, daemon=True).start()
         except Exception:                    # noqa: BLE001
             pass
+
+    def _graceful_exit(self):
+        """静默装完后的退场：派回主线程事件循环再退，别打断写盘的时序。"""
+        try:
+            self.root.after(80, lambda: os._exit(0))
+        except Exception:                    # noqa: BLE001
+            os._exit(0)
+
+    def try_silent_flow(self, info, reason):
+        """
+        在后台线程里发起静默更新：拿得到流程锁才动手，拿不到就让路
+        （手动更新正忙着换 exe，绝不能两条链同时往目录里写）。
+        """
+        if not UPDATE_FLOW_LOCK.acquire(blocking=False):
+            return
+        try:
+            _silent_update_flow(reason, info, finish=self._graceful_exit)
+        except Exception as exc:             # noqa: BLE001
+            note_auto_install(False, str((info or {}).get("version") or ""),
+                              "%s：%s" % (type(exc).__name__, exc))
+            log_problem("自动更新", type(exc), exc, exc.__traceback__)
+        finally:
+            UPDATE_FLOW_LOCK.release()
+
+    def _maybe_silent_update_from_remote(self):
+        """
+        远程设置里的版本号触发（config.app_version 比本机新）。
+
+        这只是「线索」不是「命令」：真正装不装，_silent_update_flow 里会
+        再查一遍 CNB 的真实发布 —— 远端把版本写冒了（比如新版还没发出去），
+        这里顶多多发一次查询，绝不会装到一个不存在的版本。
+        """
+        if not self.cfg.get("auto_update_install", False):
+            return
+        ver = str(self.cfg.get("app_version") or "")
+        if not update_available(ver):        # 锁：写低了、写坏了、写空了都不动
+            return
+        run_silent_update("remote", finish=self._graceful_exit)
 
     # ---------------- 窗口拖拽 / 缩放 ----------------
 
@@ -5240,21 +5497,42 @@ class CountdownApp:
         threading.Thread(target=work, daemon=True).start()
         return None
 
-    def _remote_fetched(self, ok, err, manual, done):
-        """拉回来了（在主线程里跑）。"""
-        self._remote_fetching = False
+    def _schedule_next_remote_fetch(self):
+        """按当前（可能刚被远端改过的）拉取间隔重排下一次自动拉取，返回小时数。"""
         try:
             hours = float(self.remote_cfg().get("refresh_hours") or 0)
         except (TypeError, ValueError):
             hours = 0.0
         self._remote_next_at = time.time() + (hours * 3600 if hours > 0
                                               else float("inf"))
+        return hours
+
+    def _remote_fetched(self, ok, err, manual, done):
+        """拉回来了（在主线程里跑）。"""
+        self._remote_fetching = False
+        try:
+            old_hours = float(self.remote_cfg().get("refresh_hours") or 0)
+        except (TypeError, ValueError):
+            old_hours = 0.0
         note = "已按远端的那份设置更新" if ok else (err or "没拉到")
 
         if ok:
             # 拉回来的可能改了配色、窗口尺寸、盯守设置……得整个重读一遍，
             # 否则界面还按旧设置画着，用户会以为「拉了但没生效」。
             self.reload_from_store()
+            # 远端配置带着 app_version 且比本机新 —— 说明发版的同时配置也
+            # 推上来了。开着自动安装的机器顺手升级，不用人挨台去点。
+            try:
+                self._maybe_silent_update_from_remote()
+            except Exception:                # noqa: BLE001
+                pass                         # 触发失败不该拖累「拉取成功」本身
+
+        # 重排必须放在 reload_from_store 之后：远端可能刚把「拉取间隔」
+        # 改了，先按旧值排的话，改完还得白等一个旧周期才生效（本机原本
+        # 填 0「只在启动时拉」时甚至永远等不到下一次）。
+        new_hours = self._schedule_next_remote_fetch()
+        if ok and new_hours != old_hours:
+            note += "；拉取间隔已改为 %g 小时" % new_hours
 
         cfg = self.remote_cfg()
         cfg["last_at"] = _stamp()
@@ -5262,6 +5540,20 @@ class CountdownApp:
         cfg["last_note"] = note
         self.cfg["remote"] = cfg
         save_config(self.cfg)
+
+        # 面板要是正好开着，上面各段还是打开那一刻的旧值（手动拉取会
+        # 整个重开面板，没这个问题）；至少把「上次拉取」那行字刷掉，
+        # 提醒用户面板上的值可能已经过期，别照着旧值点保存。
+        panel = getattr(self, "_settings", None)
+        if panel is not None:
+            try:
+                panel._sync_remote_note()
+                # 间隔刚被远端改了的话，面板上那个输入框也得跟着换：
+                # 否则用户照着旧值点一次「保存」，新间隔立刻被盖回去。
+                if new_hours != old_hours and hasattr(panel, "var_rhours"):
+                    panel.var_rhours.set("%g" % new_hours)
+            except Exception:                      # noqa: BLE001
+                pass
 
         if manual:
             self.set_notify_note("远程设置：" + note)
@@ -5321,6 +5613,19 @@ class CountdownApp:
         self._remote_fetching = False
         if ok:
             self.reload_from_store()
+            # 试拉同样会真的把远端设置写进盘（包括刚改过的拉取间隔），
+            # 所以下一次自动拉取也按新间隔重排，别让用户白等一个旧周期。
+            self._schedule_next_remote_fetch()
+            # 手动拉的成败也记进「上次拉取」那行状态 —— 不记的话，重开面板
+            # 后按钮下面显示的还是上一回自动拉的时间，让人犯疑。
+            # 此刻 self.cfg 刚在 reload_from_store 里整个重读过，落盘是安全的；
+            # 失败的这趟不落盘（状态行就够用，别拿旧快照碰盘上的配置）。
+            cfg = self.remote_cfg()
+            cfg["last_at"] = _stamp()
+            cfg["last_ok"] = True
+            cfg["last_note"] = "已按远端的那份设置更新（手动拉的）"
+            self.cfg["remote"] = cfg
+            save_config(self.cfg)
         if done:
             try:
                 done(ok, err)
@@ -5328,14 +5633,21 @@ class CountdownApp:
                 pass
 
     def remote_status_text(self):
-        """设置面板上那行小字：上次拉成没成、什么时候。"""
+        """设置面板上那行小字：上次拉成没成、什么时候，以及当前生效的间隔。"""
         cfg = self.remote_cfg()
         at = (cfg.get("last_at") or "").strip()
         if not at:
             return "还没拉过"
         when = at[:16]
         if cfg.get("last_ok"):
-            return "%s 成功" % when
+            # 把当前间隔也带上：远端刚把它改了的话，用户在这儿能直接看见，
+            # 不用去翻配置文件（间隔是被远端改的，最容易「改了没感觉」）。
+            try:
+                hours = float(cfg.get("refresh_hours") or 0)
+            except (TypeError, ValueError):
+                hours = 0.0
+            tail = ("每 %g 小时拉一次" % hours) if hours > 0 else "只在启动时拉"
+            return "%s 成功 · %s" % (when, tail)
         return "%s 失败：%s" % (when, (cfg.get("last_note") or "")[:60])
 
     def _drop_legacy_shutdown_keys(self):
@@ -7426,7 +7738,7 @@ class SettingsPanel:
                             bg=pal["paper"], fg=pal["border"],
                             font=(app.fam_cn, 9), anchor="w", justify="left"), 40).pack(
             fill="x", pady=(3, 0))
-        self._wrap(tk.Label(wrap, text="　密码只存本机（已加密），不会写进远端那份设置里。",
+        self._wrap(tk.Label(wrap, text="　密码只存本机（已加密）；拉取间隔可由远端母本统一下发，拉到即生效。",
                             bg=pal["paper"], fg=pal["border"],
                             font=(app.fam_cn, 9), anchor="w", justify="left"), 40).pack(
             fill="x", pady=(1, 0))
@@ -7531,8 +7843,14 @@ class SettingsPanel:
         def done(ok, why):
             if ok:
                 self.remote_msg.configure(
-                    text="　取到了，已按远端那份更新（只改挑中的项）",
+                    text="　取到了，已按远端那份更新（只改挑中的项）。面板这就重开，按新设置显示",
                     fg="#4F7A52")
+                # 光改这一行字不够：面板上其余各段（盯守、关机、配色……）
+                # 还是打开面板那一刻的旧值，用户转头就会看见「盯守怎么没变」，
+                # 再顺手一保存，刚拉来的值又被旧快照盖回去。所以拉成功后
+                # 整个面板按盘上现值重开一遍 —— 跟「从文件导入」成功后关
+                # 面板是同一个道理，这里替用户把重开这步也做了。
+                self.app.root.after(1200, self._reopen_fresh)
             else:
                 self.remote_msg.configure(
                     text="　没取到：" + (why or "原因不明"), fg=self.pal["seal"])
@@ -7540,6 +7858,15 @@ class SettingsPanel:
         why = self.app.fetch_remote_with(cfg, creds, done=done)
         if why:
             self.remote_msg.configure(text="　" + why, fg=self.pal["seal"])
+
+    def _reopen_fresh(self):
+        """拉取成功后按盘上现值重开面板。定时挂在 root 上，面板可能已不在。"""
+        app = self.app
+        # 这 1.2 秒里用户自己把面板关了的话，别再弹出来 —— 那是他的「关闭」。
+        if getattr(app, "_settings", None) is not self:
+            return
+        app.close_settings()
+        app.open_settings()
 
     def _pick_remote_items(self):
         """挑「从网址取回来的那份，认哪几项」。复用导出共用设置那个小窗。"""
@@ -7587,10 +7914,13 @@ class SettingsPanel:
         self.var_autostart = tk.BooleanVar(value=is_autostart_on())
         self.var_autoupd = tk.BooleanVar(
             value=bool(app.cfg.get("auto_update_check", True)))
+        self.var_autoinst = tk.BooleanVar(
+            value=bool(app.cfg.get("auto_update_install", False)))
         for var, text in ((self.var_lock, "锁定窗口尺寸（禁止拖拽边缘缩放）"),
                           (self.var_top, "窗口总在最前"),
                           (self.var_autostart, "开机自动运行（写入当前用户启动项）"),
-                          (self.var_autoupd, "自动检查新版本（每七天一次，不打扰）")):
+                          (self.var_autoupd, "自动检查新版本（每七天一次，不打扰）"),
+                          (self.var_autoinst, "发现新版本自动下载安装（不询问，装完自动重启一次）")):
             self._wrap(tk.Checkbutton(parent, text="  " + text, variable=var,
                                       bg=pal["paper"], fg=pal["ink"],
                                       selectcolor="#FFFBF2",
@@ -7599,6 +7929,29 @@ class SettingsPanel:
                                       font=(app.fam_cn, 10), anchor="w",
                                       justify="left", bd=0,
                                       highlightthickness=0), 62).pack(
+                fill="x", padx=20)
+
+        # 上次静默更新的结果：无人值守时程序自己换过版本，总得有个地方
+        # 能看到「它自己动了什么」，不然用户只会觉得窗口莫名重启了一下。
+        rec = reg_store_read(AUTO_INSTALL_KEY, {})
+        if isinstance(rec, dict) and rec.get("ts"):
+            from datetime import datetime as _dt
+            try:
+                when = _dt.fromtimestamp(float(rec["ts"])).strftime("%m-%d %H:%M")
+            except (TypeError, ValueError, OSError):
+                when = ""
+            if rec.get("ok"):
+                tip, color = "上次自动更新：v%s（%s）%s" % (
+                    rec.get("ver") or "?", when, rec.get("err") or ""), "#4F7A52"
+            else:
+                tip, color = "上次自动更新没成：%s（%s）" % (
+                    rec.get("err") or "原因不明", when), pal["seal"]
+        else:
+            tip, color = "", pal["border"]
+        if tip:
+            self._wrap(tk.Label(parent, text="　" + tip, bg=pal["paper"],
+                                fg=color, font=(app.fam_cn, 9),
+                                anchor="w", justify="left"), 62).pack(
                 fill="x", padx=20)
 
         self._preview()
@@ -8610,11 +8963,14 @@ class SettingsPanel:
         # 自动检查开关不动 apply_settings 的签名（那会牵动一圈调用点），
         # 直接改在 cfg 上 —— apply_settings 末尾本来就会 save_config 落盘。
         self.app.cfg["auto_update_check"] = bool(self.var_autoupd.get())
+        self.app.cfg["auto_update_install"] = bool(self.var_autoinst.get())
 
         # 远程设置的密码 / 令牌跟邮箱授权码走同一个凭据段 ——
         # 同一套加密、同一套「永不参与同步」的待遇。
-        secret = dict(secret or {})
-        secret.update(remote_creds)
+        # 空着没填的键摘掉不写：留空 ＝ 保持原样（见 drop_empty_creds），
+        # 否则旧快照一保存就把本机存得好好的密码抹空。
+        secret = drop_empty_creds(secret or {})
+        secret.update(drop_empty_creds(remote_creds or {}))
 
         err = self.app.apply_settings(self.entry.get(), thresholds,
                                       self.var_lock.get(), self.var_top.get(),
@@ -8874,6 +9230,11 @@ class SettingsPanel:
 
     def _update_ready(self, info, exe):
         """第二次确认：包已经下好且校验通过，问现在换不换。"""
+        # 换 exe 是全流程唯一真正动刀的一步，必须和静默更新互斥 ——
+        # 两条链同时改名/就位，.old 会互相踩，谁也回不了头。
+        if not UPDATE_FLOW_LOCK.acquire(blocking=False):
+            self._update_stop("后台正在自动更新，请稍后再点", self.pal["seal"])
+            return
         ok = messagebox.askyesno(
             "更新已就绪",
             "新版本 v%s 已下载并通过校验。\n\n"
@@ -8884,11 +9245,13 @@ class SettingsPanel:
             % info.get("version", "?"),
             parent=self.win)
         if not ok:
+            UPDATE_FLOW_LOCK.release()       # 用户说不换了，把锁交出来
             self._update_stop("已下载，等你决定何时重启", self.pal["ink_soft"])
             return
 
         ok2, err = install_update(exe)
         if not ok2:
+            UPDATE_FLOW_LOCK.release()
             self._update_stop(str(err or "更新失败"), self.pal["seal"])
             return
 
