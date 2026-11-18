@@ -51,7 +51,7 @@ APP_SUB = "ANCIENT COUNTDOWN"
 # 在线升级靠它判断「有没有新版」：两边都是 "主.次" 两段数字，
 # 比较时拆成 (1, 3) 这样的小元组比大小 —— 字符串比会出事，
 # "1.10" < "1.9" 在字符串世界里是成立的，那会让用户升不上去。
-APP_VERSION = "1.13.6"
+APP_VERSION = "1.13.7"
 
 MIN_W, MIN_H = 300, 150          # 窗口最小尺寸
 # 数字字号的下限。宁可让它稍微顶出一点，也不缩到看不清：
@@ -1195,26 +1195,24 @@ def reset_factory_data():
 # 文件只承担「投喂」这一个角色，两边都不别扭。
 # --------------------------------------------------------------------------
 
-SHARED_NOTE = (
-    "这份文件是「古风倒计时」的跨机器设置，由设置面板的「导出共用设置」生成。\n"
-    "拷到另一台机器上之后，在那台机器的设置面板里点「从文件导入…」选中它，\n"
-    "设置当场生效。程序不会自己去找这个文件、也不会删它 —— 什么时候导入、\n"
-    "导哪一份，都由你当场决定。\n"
-    "· 导出时可以一项一项挑，下面「include」写的就是这一份带了哪些项；\n"
-    "  没带的那些，对方机器上原来的设置会原样保留，不会被这里覆盖。\n"
-    "· 本机抬头（寄信署名）不在这个文件里，每台机器各自设。\n"
-    "· 开机自启也不在里面，那是每台机器自己的事。\n"
-    "· config.remote.refresh_min 是各机「隔多久来拉一次设置」的间隔（分钟）。\n"
-    "  这份文件放到网址上时，各机拉到会当场按它改自己的间隔、并重新安排\n"
-    "  下一次拉取，不用重启（只认 1~10080 分钟，即一星期以内；写 0 不认，\n"
-    "  那会让全线机器都不再自动拉，以后改这份文件也送不过去）。\n"
-    "  不想跟随的机器可以在「挑同步哪些项…」里不勾「拉取间隔」。\n"
-    "· 文件里可能有邮箱授权码、远程设置的密码与令牌，是明文。\n"
-    "  别放进公共网盘、别发到群里；要发布到公开场合，请在导出时勾选\n"
-    "  「敏感信息脱敏」—— 那些凭据会变成 ***，看到它的机器保留自己的。\n"
-    "· 想改内容就用记事本改（存成 UTF-8），再拷给别的机器。改坏了程序会\n"
-    "  拒绝读入，并且故意不删文件，方便你改回来。"
-)
+# 文件顶上那几行「这份文件是干什么的」。故意写得短 —— 每个配置项自己的
+# 说明在各段里（见 SECTION_NOTES），别再往这里堆。
+#
+# 用列表而不是一整段带 \n 的字符串：json.dumps 会把真换行转义成 \n 两个字符，
+# 记事本里看到的是挤成一行的一长串；列表则是一条一行，读起来才像注释。
+SHARED_NOTE = [
+    "「古风倒计时」的跨机器设置。程序只读 config 与 notify_secret 两段。",
+    "本文件里的 // 和 # 行是注释，程序读之前会先洗掉（/* */ 块注释也认）；"
+    "每条说明都贴在它解释的那一段上面。",
+    "用法①：放到网址上，各机在「远程设置」里填地址、勾「自动从网址取回设置」，按间隔自动来取；",
+    "用法②：拷到 U 盘，在设置面板「共用设置」里点「从文件导入…」当场生效。"
+    "程序不会自己去找这个文件，也不会删它。",
+    "合并规矩：逐键覆盖 —— 文件里写了哪个键就盖哪个；没写的键，各机器保持原样。",
+    "凭据只在 U 盘导入时才认，远程那条路永远不读 notify_secret；空串与 *** 都表示「保留本机原值」。",
+    "schema 固定 1；app 固定「古风倒计时」；version / exported_at 是导出时的版本与时间戳（纯记录）；"
+    "masked=true 表示凭据已打码。",
+    "改完必须存成 UTF-8。类型写错（比如把一段设置写成文字）程序会整份拒收，不会写坏配置。",
+]
 
 # 脱敏导出时，凭据的统一替身。
 # 为什么要有个固定值而不是留空：空串在 JSON 里和「这项没设」分不开，
@@ -1356,6 +1354,249 @@ def shared_file_path():
     return os.path.join(DATA_DIR, SHARED_FILE)
 
 
+# --------------------------------------------------------------------------
+# 分区批注（2026-11-19）
+#
+# JSON 不支持注释，所以说明只能写成 "_说明" 键。以前是全部堆在文件最顶上，
+# 打开文件先看几十行清单、再往下猜每个键是干什么的 —— 用户明确要求改掉：
+# 说明要贴在它解释的那一段上面。
+#
+# 两条硬规矩：
+#   ① 以 "_" 开头的键只给人看。程序入口 strip_notes() 会递归剥掉，
+#      绝不会落进各机器的设置里（否则 deep_merge 会把批注写进配置，
+#      下次导出又带着旧批注跑，越滚越脏）。
+#   ② **绝不往 thresholds / notify.rules 这类数组里塞注释项** ——
+#      程序会把它当成一档规则去取 days / color，直接崩在取色那一步。
+#      数组的说明只能写在它父段的 _说明 里。
+# --------------------------------------------------------------------------
+SECTION_NOTES = {
+    "window": lambda seg: [
+        "window：挂件窗口。w / h 是宽高（像素）。",
+    ] + ([
+        "x / y 是出现位置（这台机器的屏内坐标；null = 各机自己定）。"
+        "屏幕比它小的机器，程序会把窗口夹回屏内。",
+    ] if ("x" in seg or "y" in seg) else [
+        "这份不带窗口位置 —— 各机仍摆在自己上次待的地方。",
+    ]),
+    "palette": lambda seg: [
+        "palette：一套八色。paper 宣纸底 / paper_night 夜色底（最后半日）/ "
+        "ink 墨 / ink_soft 淡墨 / border 古铜框 / border_soft 浅铜框 / "
+        "seal 朱砂（强调、告警）/ default_fg 常态字色。",
+    ],
+    "thresholds": lambda seg: [
+        "thresholds：颜色规则。剩余 ≤ days 天时换成 color；bg 不是 null 就连底色一起换。",
+        "程序按 days 由小到大取第一条命中的，数组里谁先谁后都不影响结果；label 只是给人看的名字。",
+        "⚠ 数组里只能放规则本身，千万别往里塞注释或说明项 —— 程序会把它当一档规则去取色；想加说明就写在这几行里（数组上方）。",
+    ],
+    "notify": lambda seg: [
+        "notify：鸿雁传书（邮件提醒）。enabled 是总开关。",
+        "provider / host / port / use_ssl：邮件服务商与服务器 —— 授权码绑在服务商上，"
+        "换服务商要连同授权码一起换。",
+        "user 发件邮箱（同时是 SMTP 登录账号）；to 收件邮箱（留空 = 发给自己）。",
+        "rules：剩几天寄一封，每档可单独关（enabled:false 的档不寄）；days 支持小数，0.5 = 12 小时。",
+        "本机抬头（signature）刻意不在共用设置里 —— 多机同步时它恰恰是唯一想区分开的东西。",
+    ],
+    "shutdown": lambda seg: [
+        "shutdown：定时关机。enabled 总开关；from_target = 倒计时归零那一刻也关机"
+        "（false = 只听下面的 at）。",
+        "grace_sec：到点先弹窗问几秒（不点才关；0 = 不弹直接关）。",
+        "at：远程排的收工时刻，写法同目标时刻，如 2026.11.4.03.55。",
+        "⚠ at 写空串 = 把各机器已排上的关机时刻【撤掉】，不是「别动」；"
+        "不排远程关机就把 at 这个键整个删掉。",
+        "⚠ 它只管几点关机，绝不会改写各机自己的目标倒计时；错过的时刻不补关。",
+    ],
+    "watch": lambda seg: [
+        "watch：窗口盯守 —— 窗口不见了才寄信（方向与下面的 mailwatch 相反）。",
+        "enabled 总开关；title 是窗口「类名」（不是标题，去面板重新挑一次最稳）；"
+        "interval_min 多久看一眼（分钟）；grace_min 连续不见几分钟才寄信"
+        "（期间每 30 秒核实，它一出现就撤销）。",
+    ],
+    "mailwatch": lambda seg: [
+        "mailwatch：窗口现身传信 —— 盯的弹窗一出现就寄信（与 watch 方向相反）。",
+        "enabled 总开关；keywords 是窗口标题关键字数组，一格一个"
+        "（按「标题包含」匹配，不分大小写与空白；最多 10 个）；"
+        "cooldown_min 是同一关键字两封信的最小间隔（分钟，防反复弹关刷屏）。",
+        "⚠ 程序刚启动、或关键字刚加时窗口已经开着的，那一集不寄，等它下次出现。",
+    ],
+    "remote": lambda seg: [
+        "remote：这份文件怎么被各机器取走。只在 U 盘导入时生效 —— "
+        "远程同步那条路程序会整段忽略它（只有 refresh_min 可单独放行）。",
+        "enabled 勾了才自动拉；url 这份文件的网络地址；"
+        "auth / user 认证方式与账号（密码只在本机填，不在这份文件里）。",
+        "refresh_min：隔几分钟拉一次（1~10080；写 0 不认 —— 那会让全线机器都不再自动拉）。",
+        "items：「认远端哪几项」的勾选，true 的项才被远端覆盖；last_at / last_ok / last_note "
+        "是程序写的拉取流水，不用手工改。",
+    ],
+}
+
+# notify_secret 段的批注（凭据段，只在 U 盘导入时才被读）。
+SECRET_NOTE = [
+    "notify_secret：凭据段。smtp_password 是邮箱授权码；"
+    "remote_password / remote_token / remote_header_name / remote_header_value 是远程设置的凭据。",
+    "只有 U 盘「从文件导入」才认这一段，远程同步永远不读它。",
+    "空串或 *** = 各机器保留自己原来的值，什么都不会丢。",
+]
+
+
+def strip_notes(node):
+    """递归剥掉以 _ 开头的批注键（"_说明" 之类）。"""
+    if isinstance(node, dict):
+        return dict((k, strip_notes(v)) for k, v in node.items()
+                    if not (isinstance(k, str) and k.startswith("_")))
+    if isinstance(node, list):
+        return [strip_notes(x) for x in node]
+    return node
+
+
+def strip_json_comments(text):
+    """
+    洗掉 JSON 里的注释：// 行注释、# 行注释、/* */ 块注释。洗完再交给 json.loads。
+
+    为什么不能简单 replace 或正则：字符串里也会出现 // ——
+    "url": "https://djspz.chengmo.cc:2024/mrpz.json" 按 // 切，
+    会把网址后半截当注释吃掉，配置当场坏掉。所以必须逐字符扫，
+    认得「现在在不在字符串里」以及反斜杠转义。
+
+    注释吃掉的换行会补回来（行号不变），块注释里有几行就补几个空行 ——
+    这样 json.loads 报行号时还能指回文件里对得上的那一行。
+    """
+    out = []
+    i = 0
+    n = len(text)
+    in_str = False
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])       # 转义对（含 \"）原样带走
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "/":
+            j = text.find("\n", i)
+            if j < 0:
+                break
+            i = j
+            continue
+        if ch == "#":
+            j = text.find("\n", i)
+            if j < 0:
+                break
+            i = j
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            j = text.find("*/", i + 2)
+            if j < 0:
+                # 没闭合：不猜，原样留着让 json.loads 报错
+                out.append(ch)
+                i += 1
+                continue
+            out.append("\n" * text.count("\n", i, j + 2))
+            i = j + 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _config_head_note(cfg):
+    """config 段开头那几行：讲合并规矩 + 列出本段的顶层标量。"""
+    head = ["设置段：逐键覆盖 —— 这里写了的键盖掉各机器同名键，没写的键各机器原样保留。"]
+    scal = []
+    if "locked" in cfg:
+        scal.append("locked 锁定窗口尺寸")
+    if "always_on_top" in cfg:
+        scal.append("always_on_top 总在最前")
+    if "auto_update_check" in cfg:
+        scal.append("auto_update_check 开机后自动检查更新（七天一次限频）")
+    if "auto_update_install" in cfg:
+        scal.append("auto_update_install 发现新版本直接装，不再询问")
+    if "app_version" in cfg:
+        scal.append("app_version 这份配置出自哪一版，程序据它决定要不要跟进升级")
+    if any(k in cfg for k in ("zero_text", "zero_color", "zero_color_alt")):
+        scal.append("zero_text / zero_color / zero_color_alt 倒计时归零时那行字，"
+                    "与闪烁交替的两种颜色")
+    if scal:
+        head.append("· 本段顶层标量：" + "；".join(scal) + "。")
+    return head
+
+
+def bundle_notes(bundle, top_note=None):
+    """
+    按这份包里实际有的段，攒出「路径 → 注释行」的映射。
+
+    路径是元组，指向「注释写在哪个键前面」：("config", "window") 表示
+    那几行注释紧贴在 "window": {...} 上面。这样注释不用再伪装成键，
+    文件里就是干干净净的 // 行。
+
+    top_note 不给就用 SHARED_NOTE（面板导出的标准说明）；发布模板那种
+    想用自己的开场白，把行列表传进来即可。
+    """
+    notes = {}
+    if not isinstance(bundle, dict) or not bundle:
+        return notes
+    # 文件头那段全局说明：挂在包里第一个键前面（视觉上就是文件开头）
+    first = next(iter(bundle))
+    notes[(first,)] = list(SHARED_NOTE if top_note is None else top_note)
+    cfg = bundle.get("config")
+    if isinstance(cfg, dict):
+        notes[("config",)] = _config_head_note(cfg)
+        for k, v in cfg.items():
+            spec = SECTION_NOTES.get(k)
+            if spec is not None:
+                notes[("config", k)] = list(spec(v))
+    if isinstance(bundle.get("notify_secret"), dict):
+        notes[("notify_secret",)] = list(SECRET_NOTE)
+    return notes
+
+
+def dumps_pretty(node, notes=None, indent=0, path=()):
+    """
+    把设置包渲染成「带 // 注释的 JSON 文本」。json.dumps 写不出注释，
+    所以自己走一遍树；注释总是在某个键的前一行（见 bundle_notes）。
+
+    渲染完调用方必须自验一遍：json.loads(strip_json_comments(文本)) 要和
+    原对象完全相等 —— 这是防止本函数某个分支写坏逗号/括号的唯一硬闸门。
+    """
+    notes = notes or {}
+    pad = "  " * indent
+    inner = "  " * (indent + 1)
+    if isinstance(node, dict):
+        if not node:
+            return "{}"
+        items = list(node.items())
+        lines = ["{"]
+        for idx, (k, v) in enumerate(items):
+            for line in notes.get(path + (k,)) or ():
+                lines.append("%s// %s" % (inner, line))
+            body = dumps_pretty(v, notes, indent + 1, path + (k,))
+            comma = "," if idx < len(items) - 1 else ""
+            lines.append("%s%s: %s%s"
+                         % (inner, json.dumps(k, ensure_ascii=False), body, comma))
+        lines.append(pad + "}")
+        return "\n".join(lines)
+    if isinstance(node, list):
+        if not node:
+            return "[]"
+        lines = ["["]
+        for idx, v in enumerate(node):
+            body = dumps_pretty(v, notes, indent + 1, path + (idx,))
+            comma = "," if idx < len(node) - 1 else ""
+            lines.append("%s%s%s" % (inner, body, comma))
+        lines.append(pad + "]")
+        return "\n".join(lines)
+    return json.dumps(node, ensure_ascii=False)
+
+
 def build_shared_bundle(cfg, secret, selection=None, masked=False):
     """
     攒出「可以搬去别的机器」的那部分设置。
@@ -1413,7 +1654,6 @@ def build_shared_bundle(cfg, secret, selection=None, masked=False):
     else:
         notify_secret = dict((k, sec.get(k) or "") for k in SECRET_FIELDS)
     bundle = {
-        "_说明": SHARED_NOTE,
         "schema": SHARED_SCHEMA,
         "app": APP_NAME,
         "version": APP_VERSION,
@@ -1444,12 +1684,18 @@ def parse_shared_bundle(blob):
       ① 完整形态（导出时写的）：{"config": {...}, "notify_secret": {...}}
       ② 裸配置：整份就是配置本身 —— 有人会把老版本留下的
          countdown_config.json 直接改名拿过来用，不该让他白跑一趟。
+
+    注释也认（2026-11-19 起）：// 行注释、# 行注释、/* */ 块注释，
+    进 json.loads 之前先经 strip_json_comments 洗掉。这样「说明」不必再
+    伪装成 "_说明" 键，文件里就是正常的注释行。
     """
     try:
-        data = json.loads(blob.decode("utf-8-sig"))
+        text = blob.decode("utf-8-sig")
     except UnicodeDecodeError:
         return None, ("这个文件不是 UTF-8 文本，程序读不了。"
                       "请用记事本打开、另存为时把编码选成 UTF-8。")
+    try:
+        data = json.loads(strip_json_comments(text))
     except ValueError as exc:
         return None, "这个文件不是合法的设置文件（%s）" % exc
     if not isinstance(data, dict):
@@ -1535,7 +1781,7 @@ def apply_shared_config(bundle):
     if not isinstance(cfg_in, dict):
         return False, "里面没有 config 这一段"
 
-    cfg_in = json.loads(json.dumps(cfg_in))
+    cfg_in = strip_notes(json.loads(json.dumps(cfg_in)))
     # 双保险：导出时不写抬头和自启，导入时也不认 —— 就算有人手工往文件里
     # 加了这两项，也顶不掉本机的抬头、也不会关掉本机的自启。
     cfg_in.pop("autostart", None)
@@ -1605,7 +1851,15 @@ def export_shared_config(path, cfg, secret, selection=None, masked=False):
     masked=True = 脱敏导出（凭据打码，可安全发布），见 build_shared_bundle。
     """
     bundle = build_shared_bundle(cfg, secret, selection, masked=masked)
-    text = json.dumps(bundle, ensure_ascii=False, indent=2) + "\n"
+    text = dumps_pretty(bundle, bundle_notes(bundle)) + "\n"
+    # 自验：洗掉注释后必须与原对象完全相等。渲染器里任何一个逗号/括号写错，
+    # 都会在这里被拦住 —— 宁可报“导出失败”，也不能写出一个自己都读不回来的文件。
+    try:
+        round_trip = json.loads(strip_json_comments(text))
+    except ValueError as exc:
+        return False, "内部错误：生成的文件自己读不回来（%s）" % exc
+    if round_trip != bundle:
+        return False, "内部错误：生成的文件内容与原设置对不上"
     try:
         # 带 BOM 写：用户多半会拿记事本打开看一眼，老记事本见到没 BOM 的
         # UTF-8 会认成 ANSI，中文全糊。读回来时 utf-8-sig 会把 BOM 吃掉，对得上。
@@ -1859,7 +2113,7 @@ def apply_remote_config(bundle, items=None):
     if not isinstance(cfg_in, dict):
         return False, "取回来的东西里没有 config 这一段"
 
-    cfg_in = json.loads(json.dumps(cfg_in))
+    cfg_in = strip_notes(json.loads(json.dumps(cfg_in)))
     cfg_in.pop("autostart", None)
     cfg_in.pop("panel", None)      # 面板尺寸各机各管各的，见 apply_shared_config
     # 窗口坐标不在这里硬剔（2026-10-31 起）：认 remote.items 里的「窗口位置」

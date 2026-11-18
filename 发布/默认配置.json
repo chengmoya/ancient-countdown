@@ -1,72 +1,95 @@
 {
- "_说明": "这份是「古风倒计时」的默认配置模板（v1.13.6 生成）。\n\n两种用法：\n· 远程设置：把这个文件放到一个网址上，在每台机器的设置面板「远程设置」\n  里填上地址、勾上「自动从网址取回设置」，各台机器会定时自己来取；\n· 文件导入：在设置面板「共用设置」里点「从文件导入…」选中它，当场生效。\n\n两条路的行为一样：文件里写了的项会覆盖各机器对应的设置，没写的项\n各机器保持原样。邮箱、授权码、目标时刻这些「每台不一样」的东西刻意\n不在里面 —— 想统一哪一项，自己在 config 里补上那个键（键名见\n使用说明.md 第八章的配置表）。\n\n定时关机（本版重点）：config.shutdown.at 就是关机时刻，写法同目标时刻\n（如 \"2026.10.20.18.00\"），填上之后各台机器取回来就排上；留空 = 不指定。\n要启用定时关机，把 config.shutdown.enabled 改成 true。\n这是关机时刻的唯一来源（v1.11 起不再支持单独填一个网址去取时刻）。\n\n改内容用记事本，存成 UTF-8。改坏了程序会拒绝读入，并且不删文件。",
- "schema": 1,
- "app": "古风倒计时",
- "version": "1.13.6",
- "config": {
-  "locked": false,
-  "always_on_top": true,
-  "auto_update_check": true,
-  "window": {
-   "x": null,
-   "y": null,
-   "w": 620,
-   "h": 300
-  },
-  "palette": {
-   "paper": "#EFE4CE",
-   "paper_night": "#1C1A17",
-   "ink": "#2B2622",
-   "ink_soft": "#6B5F52",
-   "border": "#8C6B4A",
-   "border_soft": "#C4A87C",
-   "seal": "#B03A2E",
-   "default_fg": "#3A322A"
-  },
-  "thresholds": [
-   {
-    "days": 7.0,
-    "color": "#4F7A52",
-    "bg": null,
-    "label": "一周内"
-   },
-   {
-    "days": 4.0,
-    "color": "#C08A1E",
-    "bg": null,
-    "label": "四天内"
-   },
-   {
-    "days": 2.0,
-    "color": "#B03A2E",
-    "bg": null,
-    "label": "两日内"
-   },
-   {
-    "days": 0.5,
-    "color": "#F2EFE4",
-    "bg": "#1C1A17",
-    "label": "最后半日"
-   }
-  ],
-  "zero_text": "時辰已到",
-  "zero_color": "#B03A2E",
-  "zero_color_alt": "#D9A13B",
-  "shutdown": {
-   "enabled": false,
-   "from_target": true,
-   "grace_sec": 60,
-   "at": ""
-  },
-  "watch": {
-   "enabled": false,
-   "interval_min": 30,
-   "grace_min": 10
-  },
-  "mailwatch": {
-   "enabled": false,
-   "keywords": [],
-   "cooldown_min": 5
+  // 「古风倒计时」默认配置模板（v1.13.7 生成）。程序只读 config 一段；以 // 或 # 开头的行都是注释，程序读之前会先洗掉，写啥都不影响。
+  // 用法①：放到网址上，各机在「远程设置」里填地址、勾「自动从网址取回设置」，按间隔自动来取；
+  // 用法②：拷到 U 盘，在设置面板「共用设置」里点「从文件导入…」当场生效。
+  // 合并规矩：逐键覆盖 —— 写了哪个键就盖哪个，没写的键各机器保持原样。
+  // 这份故意不含邮箱、授权码、目标时刻、窗口名这些「每台不一样」的东西；想统一哪一项，自己往 config 里补上那个键（键名见 使用说明.md 第八章的配置表）。
+  // 改完用记事本存成 UTF-8。改坏了程序会拒绝读入，并且不删文件。
+  "schema": 1,
+  "app": "古风倒计时",
+  "version": "1.13.7",
+  // 设置段：逐键覆盖 —— 这里写了的键盖掉各机器同名键，没写的键各机器原样保留。
+  // · 本段顶层标量：locked 锁定窗口尺寸；always_on_top 总在最前；auto_update_check 开机后自动检查更新（七天一次限频）；zero_text / zero_color / zero_color_alt 倒计时归零时那行字，与闪烁交替的两种颜色。
+  "config": {
+    "locked": false,
+    "always_on_top": true,
+    "auto_update_check": true,
+    // window：挂件窗口。w / h 是宽高（像素）。
+    // x / y 是出现位置（这台机器的屏内坐标；null = 各机自己定）。屏幕比它小的机器，程序会把窗口夹回屏内。
+    "window": {
+      "x": null,
+      "y": null,
+      "w": 620,
+      "h": 300
+    },
+    // palette：一套八色。paper 宣纸底 / paper_night 夜色底（最后半日）/ ink 墨 / ink_soft 淡墨 / border 古铜框 / border_soft 浅铜框 / seal 朱砂（强调、告警）/ default_fg 常态字色。
+    "palette": {
+      "paper": "#EFE4CE",
+      "paper_night": "#1C1A17",
+      "ink": "#2B2622",
+      "ink_soft": "#6B5F52",
+      "border": "#8C6B4A",
+      "border_soft": "#C4A87C",
+      "seal": "#B03A2E",
+      "default_fg": "#3A322A"
+    },
+    // thresholds：颜色规则。剩余 ≤ days 天时换成 color；bg 不是 null 就连底色一起换。
+    // 程序按 days 由小到大取第一条命中的，数组里谁先谁后都不影响结果；label 只是给人看的名字。
+    // ⚠ 数组里只能放规则本身，千万别往里塞注释或说明项 —— 程序会把它当一档规则去取色；想加说明就写在这几行里（数组上方）。
+    "thresholds": [
+      {
+        "days": 7.0,
+        "color": "#4F7A52",
+        "bg": null,
+        "label": "一周内"
+      },
+      {
+        "days": 4.0,
+        "color": "#C08A1E",
+        "bg": null,
+        "label": "四天内"
+      },
+      {
+        "days": 2.0,
+        "color": "#B03A2E",
+        "bg": null,
+        "label": "两日内"
+      },
+      {
+        "days": 0.5,
+        "color": "#F2EFE4",
+        "bg": "#1C1A17",
+        "label": "最后半日"
+      }
+    ],
+    "zero_text": "時辰已到",
+    "zero_color": "#B03A2E",
+    "zero_color_alt": "#D9A13B",
+    // shutdown：定时关机。enabled 总开关；from_target = 倒计时归零那一刻也关机（false = 只听下面的 at）。
+    // grace_sec：到点先弹窗问几秒（不点才关；0 = 不弹直接关）。
+    // at：远程排的收工时刻，写法同目标时刻，如 2026.11.4.03.55。
+    // ⚠ at 写空串 = 把各机器已排上的关机时刻【撤掉】，不是「别动」；不排远程关机就把 at 这个键整个删掉。
+    // ⚠ 它只管几点关机，绝不会改写各机自己的目标倒计时；错过的时刻不补关。
+    "shutdown": {
+      "enabled": false,
+      "from_target": true,
+      "grace_sec": 60,
+      "at": ""
+    },
+    // watch：窗口盯守 —— 窗口不见了才寄信（方向与下面的 mailwatch 相反）。
+    // enabled 总开关；title 是窗口「类名」（不是标题，去面板重新挑一次最稳）；interval_min 多久看一眼（分钟）；grace_min 连续不见几分钟才寄信（期间每 30 秒核实，它一出现就撤销）。
+    "watch": {
+      "enabled": false,
+      "interval_min": 30,
+      "grace_min": 10
+    },
+    // mailwatch：窗口现身传信 —— 盯的弹窗一出现就寄信（与 watch 方向相反）。
+    // enabled 总开关；keywords 是窗口标题关键字数组，一格一个（按「标题包含」匹配，不分大小写与空白；最多 10 个）；cooldown_min 是同一关键字两封信的最小间隔（分钟，防反复弹关刷屏）。
+    // ⚠ 程序刚启动、或关键字刚加时窗口已经开着的，那一集不寄，等它下次出现。
+    "mailwatch": {
+      "enabled": false,
+      "keywords": [],
+      "cooldown_min": 5
+    }
   }
- }
 }
