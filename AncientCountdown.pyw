@@ -51,7 +51,7 @@ APP_SUB = "ANCIENT COUNTDOWN"
 # 在线升级靠它判断「有没有新版」：两边都是 "主.次" 两段数字，
 # 比较时拆成 (1, 3) 这样的小元组比大小 —— 字符串比会出事，
 # "1.10" < "1.9" 在字符串世界里是成立的，那会让用户升不上去。
-APP_VERSION = "1.13.4"
+APP_VERSION = "1.13.5"
 
 MIN_W, MIN_H = 300, 150          # 窗口最小尺寸
 # 数字字号的下限。宁可让它稍微顶出一点，也不缩到看不清：
@@ -2449,6 +2449,70 @@ def update_available(remote_version):
         return False
 
 
+# ── 程序自带的根证书 ───────────────────────────────────────────────
+# 为什么要自带：Python 的 ssl 在 Windows 上只读系统证书库，而系统库被
+# 精简过的机器（装机店的"纯净版"、清理过证书的"优化版"）会缺 Let's
+# Encrypt 的信任锚 ISRG Root X1，于是远程设置 / 检查更新一律报
+# CERTIFICATE_VERIFY_FAILED。浏览器不会中招，因为它走 Schannel，缺根
+# 时会自己去 Windows Update 补 —— Python 没有这条路。
+# 把这一张钉进程序里，等于把信任锚从系统手里收回来，走到哪都能验通；
+# 系统库正常时它和系统里那张重复，OpenSSL 会忽略，无害。
+# 来源：https://letsencrypt.org/certs/isrgrootx1.pem（自签，2035-06-04 到期）
+ISRG_ROOT_X1_PEM = """\
+-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
+NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
+ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
+TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
+jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
+oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
+4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
+mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
+emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+-----END CERTIFICATE-----
+"""
+
+
+def _ssl_context():
+    """
+    「系统根证书库 + 程序自带根证书」的 SSL 上下文。
+
+    系统库正常时，行为与 urlopen 的默认上下文完全一致；系统库被精简时，
+    自带的那张 ISRG Root X1 顶上缺失的信任锚。返回 None 表示这台机器
+    连 ssl 模块都拿不到，调用方退回默认路径（不能因为这张证书把网络打死）。
+    """
+    try:
+        import ssl
+        ctx = ssl.create_default_context()
+        try:
+            ctx.load_verify_locations(cadata=ISRG_ROOT_X1_PEM)
+        except Exception:
+            pass        # 自带证书本身有问题也不该拖垮整条网络栈
+        return ctx
+    except Exception:
+        return None
+
+
 def _http_get(url, timeout=UPDATE_CONNECT_TIMEOUT, max_bytes=None,
               headers=None, progress=None):
     """
@@ -2466,8 +2530,11 @@ def _http_get(url, timeout=UPDATE_CONNECT_TIMEOUT, max_bytes=None,
     req.add_header("User-Agent", "AncientCountdown/%s" % APP_VERSION)
     for k, v in (headers or {}).items():
         req.add_header(k, v)
+    # 带上「系统库 + 自带根证书」的上下文；拿不到上下文就退回默认路径
+    _ctx = _ssl_context()
+    _extra = {"context": _ctx} if _ctx is not None else {}
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, **_extra) as resp:
             total = -1
             try:
                 total = int(resp.headers.get("Content-Length") or -1)
@@ -2502,6 +2569,10 @@ def _net_error_text(exc):
         return "连接超时（%d 秒没响应），多半是网络不通" % UPDATE_CONNECT_TIMEOUT
     if "getaddrinfo" in str(exc) or "Name or service" in str(exc):
         return "找不到服务器地址，检查网络连接"
+    low = str(exc).lower()
+    if "certificate verify failed" in low or "certificate_verify_failed" in low:
+        return ("证书验证不通过：程序已带上自带的根证书仍没验过，"
+                "多半是这台机器有代理或杀毒在做 HTTPS 解密，把它关掉再试")
     return "%s：%s" % (name, exc)
 
 
