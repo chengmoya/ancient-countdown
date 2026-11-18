@@ -51,7 +51,7 @@ APP_SUB = "ANCIENT COUNTDOWN"
 # 在线升级靠它判断「有没有新版」：两边都是 "主.次" 两段数字，
 # 比较时拆成 (1, 3) 这样的小元组比大小 —— 字符串比会出事，
 # "1.10" < "1.9" 在字符串世界里是成立的，那会让用户升不上去。
-APP_VERSION = "1.13.5"
+APP_VERSION = "1.13.6"
 
 MIN_W, MIN_H = 300, 150          # 窗口最小尺寸
 # 数字字号的下限。宁可让它稍微顶出一点，也不缩到看不清：
@@ -2392,7 +2392,7 @@ def shichen_name(hour):
     return CN_SHICHEN[((hour + 1) // 2) % 12]
 
 
-def pretty_target(dt):
+def pretty_target(dt, force_year=False):
     """把 datetime 渲染成直白写法，例如「10月1日 11:30」。
 
     早先这里写的是古风「十月初一 · 午时」，看着有意境，实际是个坑：
@@ -2408,10 +2408,14 @@ def pretty_target(dt):
     年份只在「不是今年」时才补上（「2027年1月1日 0:00」）：跨年目标若不写
     年份，用户看不出到底是哪一年的 1 月 1 日；同年目标则不必啰嗦。
     秒为 0 时省略，避免「0:00:00」这种无意义的尾巴。
+
+    force_year=True 则一律带年份 —— 主界面「关机」那行要用：目标时刻是
+    「为什么事倒数」，写不写年都行；关机时刻是「这台机器哪一刻关」，属执行
+    指令，必须没有歧义，而且两行都带年份时长度接近、左右才对得齐。
     """
     if not dt:
         return "尚未设定"
-    if dt.year != datetime.datetime.now().year:
+    if force_year or dt.year != datetime.datetime.now().year:
         head = "%d年%d月%d日" % (dt.year, dt.month, dt.day)
     else:
         head = "%d月%d日" % (dt.month, dt.day)
@@ -4219,7 +4223,7 @@ class CountdownApp:
         """
         pal = self.cfg["palette"]
         heavy, light = pal["ink"], pal["paper"]
-        # "title" 比 soft 更实一点：顶上那行「目標 · 某月某日」要说清楚在倒数
+        # "title" 比 soft 更实一点：顶上那行「目标 · 某月某日」要说清楚在倒数
         # 哪一天，太淡了在小窗口上就跟没有一样。
         ratio = {"strong": 0.0, "title": 0.14, "soft": 0.28,
                  "faint": 0.52}.get(level, 0.28)
@@ -4310,25 +4314,102 @@ class CountdownApp:
                           ox + sx * (arm - 4), oy + sy * 7,
                           fill=pal["border_soft"], width=1)
 
+    def _shutdown_head(self):
+        """
+        「关机」那行的内容：(显示文本, 量宽用的时刻文本, 状态词是否居中)。
+
+        没有关机时刻就返回 None —— 整行不画，数字区也不为它留位置。
+
+        ⚠️ 「这行在不在」只由 shutdown.at 决定，**绝不把「已过」算进判据**：
+        判据要是跟着秒走，跨过时刻的那一帧行高就会变，整串数字跟着往上跳。
+        「已过」只换文字，不动布局。
+
+        量宽用时刻文本、不用「未启用 / 已过」：状态词短，按它量宽的话时间列
+        会缩水、整块跟着挪位，开关一关整行就跳一下，看着像出了 bug。
+        """
+        dt = self.shutdown_at
+        if dt is None:
+            return None
+        moment = pretty_target(dt, force_year=True)
+        if not self.shutdown_cfg().get("enabled"):
+            return ("未启用", moment, True)
+        if dt <= datetime.datetime.now():
+            return ("已过", moment, True)
+        return (moment, moment, False)
+
     def _draw_head(self, W, H):
-        """顶部目标时刻（写清楚在倒数什么）+ 左下角当前规则名。"""
+        """
+        顶部两行：目标时刻（写清楚在倒数什么）+ 远程关机时刻。
+
+        两行**同字号、同颜色**，按「标签列 + 时间列」摆：左边「目标 / 关机」
+        左缘对齐，右边年月日时分也对齐，整块再居中。字号或字重差一档，第二
+        行立刻变成「正文 + 小注」，两行就不是一伙的了（用户原话：好丑）。
+
+        没有 shutdown.at 时只剩目标一行，位置沿用老排法，一个像素不动。
+        """
         pal = self.cfg["palette"]
         m = max(7, int(min(W, H) * 0.030))
         size = self._title_size()
         self.f_title.configure(size=size)
 
-        title = pretty_target(self.target) if self.target else "尚未设定目标时刻"
-        # 光一个日期顶在上面，不写清楚它是「目标时刻」，会有人当成今天的日期
-        # —— 尤其是「12月25日」这种看着像节日的日子。所以前缀两个字不能省。
-        text = ("目標 · " + title) if self.target else title
-        # 窄窗口下这行可能顶出两边，逐号往回收到放得下为止
+        row2 = self._shutdown_head()
+        title = pretty_target(self.target)
         limit = max(60, W - 2 * m - 24)
-        while size > 9 and self.f_title.measure(text) > limit:
+        col_gap = max(8, int(size * 0.6))
+
+        def widths():
+            label_w = self.f_title.measure("目标")
+            time_w = max(self.f_title.measure(title),
+                         self.f_title.measure(row2[1]) if row2 else 0)
+            return label_w, time_w
+
+        # 窄窗口下这两行可能顶出两边，逐号往回收到放得下为止
+        label_w, time_w = widths()
+        block = label_w + col_gap + time_w
+        while block > limit and size > 9:
             size -= 1
             self.f_title.configure(size=size)
-        self.canvas.create_text(W / 2, m + size + 6, text=text,
-                                font=self.f_title,
-                                fill=self._ink_tone("title"))
+            label_w, time_w = widths()
+            block = label_w + col_gap + time_w
+
+        x0 = (W - block) / 2.0
+        tx = x0 + label_w + col_gap
+        ink = self._ink_tone("title")
+
+        if row2 is None:
+            cy1 = m + size + 6              # 单行：老位置，一点不动
+            self.canvas.create_text(x0, cy1, text="目标", anchor="w",
+                                    font=self.f_title, fill=ink)
+            self.canvas.create_text(tx, cy1, text=title, anchor="w",
+                                    font=self.f_title, fill=ink)
+            self._head_h = int(m + size * 1.6 + 10)
+        else:
+            lh = self.f_title.metrics("linespace")
+            # 第一行不能顶着边框内线：m 是外框，内线在 m+5 / m+7，
+            # 从 m+5 起排，字形顶正好落在内线下面
+            cy1 = m + 5 + lh / 2.0
+            # 两行行盒叠 1px：楷体行盒上下留白厚（22 号字行盒 29、字形只有
+            # 22），正好把这道缝收到 6px 上下 —— 再多就散，再少就挤成一坨
+            cy2 = cy1 + lh - 1
+            self.canvas.create_text(x0, cy1, text="目标", anchor="w",
+                                    font=self.f_title, fill=ink)
+            self.canvas.create_text(tx, cy1, text=title, anchor="w",
+                                    font=self.f_title, fill=ink)
+            self.canvas.create_text(x0, cy2, text="关机", anchor="w",
+                                    font=self.f_title, fill=ink)
+            value, _moment, centered = row2
+            if centered:
+                # 「未启用 / 已过」不是时刻，没法和上面的日期对齐，
+                # 就摆在时间列正中间
+                self.canvas.create_text(tx + time_w / 2.0, cy2, text=value,
+                                        anchor="center", font=self.f_title,
+                                        fill=ink)
+            else:
+                self.canvas.create_text(tx, cy2, text=value, anchor="w",
+                                        font=self.f_title, fill=ink)
+            # 数字区上沿取「单行老高度」与「两行实际底边」的较大者：
+            # 有关机行时数字会让出这一行的高度，无它时大小一丝不变。
+            self._head_h = int(max(m + size * 1.6 + 10, cy2 + lh / 2.0 + 2))
 
         # 左下角：当前配色规则名
         label = (self.theme or {}).get("label") or ""
@@ -4482,7 +4563,7 @@ class CountdownApp:
 
     def _title_size(self):
         """
-        顶部「目標 · 某月某日」那行字的字号。
+        顶部「目标 · 某月某日」那行字的字号。
 
         比原先大一号（原来上限 16、下限 9）：窗口拉到最小时那行只有 9px，
         用户根本看不清倒计时到哪一天，而这行恰恰是「这个挂件在为什么事
@@ -4491,7 +4572,16 @@ class CountdownApp:
         return max(11, min(22, int(self.H * 0.085)))
 
     def _head_bottom(self, m=None):
-        """标题区下沿：数字从这里往下排。与 _draw_head 用同一套算法。"""
+        """
+        标题区下沿：数字从这里往下排。
+
+        优先用 _draw_head 算好的实数（_head_h）：两行文本的行盒高度只有问过
+        字体才知道，而这条路径每秒 tick 都要走一趟，每秒都去 measure 又是好几
+        次 Tcl 往返。没算过（测试里的替身对象）就退回老公式。
+        """
+        cached = getattr(self, "_head_h", None)
+        if cached is not None:
+            return cached
         m = max(7, int(min(self.W, self.H) * 0.030)) if m is None else m
         return int(m + self._title_size() * 1.6 + 10)
 
