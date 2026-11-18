@@ -51,7 +51,7 @@ APP_SUB = "ANCIENT COUNTDOWN"
 # 在线升级靠它判断「有没有新版」：两边都是 "主.次" 两段数字，
 # 比较时拆成 (1, 3) 这样的小元组比大小 —— 字符串比会出事，
 # "1.10" < "1.9" 在字符串世界里是成立的，那会让用户升不上去。
-APP_VERSION = "1.13.7"
+APP_VERSION = "1.13.8"
 
 MIN_W, MIN_H = 300, 150          # 窗口最小尺寸
 # 数字字号的下限。宁可让它稍微顶出一点，也不缩到看不清：
@@ -219,9 +219,14 @@ SHUTDOWN_RETRY_SEC = 60                  # 命令发出去了机器却没关成�
 # 「我这台机器自己该关的时候」。谁先到谁关，才符合两边各自的用途。
 SHUTDOWN_SOURCES = (("remote", "远程设置"),
                     ("target", "倒计时目标"))
-# 远程设置：启动后静置多少秒才拉第一次。留给窗口本身，也避开「刚开机网络栈
-# 还没起来」那一段 —— 那会儿去拉必然失败，只会在面板上白记一笔失败。
-REMOTE_FETCH_START_DELAY = 20
+# 远程设置：启动后静置多少秒才拉第一次。
+#
+# 2026-11-19 从 20 秒改成 90 秒，**刻意排在自动检查更新（60 秒）之后**：
+# 远程那份配置可能用新版才认的语法（例如 v1.13.7 起的 // 注释），旧版
+# 拉回来会整份判为「不是合法设置文件」。先让 60 秒那次巡检发现新版、
+# 静默换装（进程直接退出重启），新版起来后再拉，就不会先白拉一趟。
+# 升级没开或查到已是最新时，这 30 秒的等待只是让窗口先安心显示。
+REMOTE_FETCH_START_DELAY = 90
 
 # ---- 窗口盯守 ----
 #
@@ -3215,6 +3220,22 @@ def note_auto_check(ver):
                     {"last_ts": time.time(), "version": str(ver or "")})
 
 
+def note_auto_check_reset():
+    """
+    把「上次自动检查」的时间戳清零，让下一次巡检立刻真查（不等七天）。
+
+    2026-11-19 起只为一件事：远程配置拉回来被判成「不是合法设置文件」——
+    多半是远端已经换成新版才认的语法（比如 // 注释），而这台还是旧版。
+    这时候最该做的不是反复重拉，而是马上升级；升上去就正常了。
+    版本号（红点）保留，只清时间戳。
+    """
+    rec = reg_store_read(UPDATE_CHECK_KEY, {})
+    if not isinstance(rec, dict):
+        rec = {}
+    rec["last_ts"] = 0
+    reg_store_write(UPDATE_CHECK_KEY, rec)
+
+
 def log_problem(tag, exc_type, exc_value, exc_tb):
     """
     把一条异常写进崩溃日志 —— windowed exe 唯一的「留痕」手段。
@@ -6085,6 +6106,12 @@ class CountdownApp:
             return
         if self._remote_fetching or now.timestamp() < self._remote_next_at:
             return
+        # 正在下载/换装新版时先别拉（2026-11-19）：进程下一秒就要被换掉，
+        # 这一趟纯属白跑；而且旧版拉新版格式的配置只会判成非法文件。
+        # 升级失败时锁会释放，下一次 tick 自然接着拉。
+        if UPDATE_FLOW_LOCK.locked():
+            self._remote_next_at = now.timestamp() + 30
+            return
         self.fetch_remote_now(manual=False)
 
     def fetch_remote_now(self, manual=False, done=None):
@@ -6149,6 +6176,16 @@ class CountdownApp:
                 self._maybe_silent_update_from_remote()
             except Exception:                # noqa: BLE001
                 pass                         # 触发失败不该拖累「拉取成功」本身
+        elif err and ("合法设置文件" in err or "合法" in err):
+            # 远端那份文件这台机器读不懂（2026-11-19）：多半是远端已经换成
+            # 新版才认的语法（比如 v1.13.7 起的 // 注释），而本机还是旧版。
+            # 这时候最该做的不是反复重拉，而是马上升级 —— 清掉七天限频，
+            # 让巡检立刻真查一次；升上去再拉就正常了。
+            try:
+                note_auto_check_reset()
+                self.auto_update_scan()
+            except Exception:                # noqa: BLE001
+                pass                         # 兜底失败也只是「这次没升成」，不影响拉取记录
 
         # 重排必须放在 reload_from_store 之后：远端可能刚把「拉取间隔」
         # 改了，先按旧值排的话，改完还得白等一个旧周期才生效（本机原本
